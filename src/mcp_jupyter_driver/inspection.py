@@ -16,103 +16,132 @@ _SENTINEL_TAG = "mcp-helper"
 _SENTINEL = f"\x1e{_SENTINEL_TAG}\x1e"
 
 
-def _wrap(payload_expr: str) -> str:
-    return (
-        "import json as _mcp_json, sys as _mcp_sys\n"
-        f"_mcp_payload = {payload_expr}\n"
-        f"_mcp_sys.stdout.write('{_SENTINEL}' + _mcp_json.dumps(_mcp_payload) + '{_SENTINEL}')\n"
-        "_mcp_sys.stdout.flush()\n"
-    )
-
-
-_LIST_VARS_BODY = """
-_MCP_IPYTHON_INJECTED = {
-    'In', 'Out', 'get_ipython', 'exit', 'quit', 'open',
-    'PS1', 'REPLHooks', 'get_last_command', 'is_wsl', 'original_ps1',
-    'readline', 'platform', 'sys',
-}
-def _mcp_list_vars(_include_private=False):
-    _mcp_out = []
-    _mcp_g = dict(globals())
-    for _mcp_n, _mcp_v in _mcp_g.items():
-        if _mcp_n.startswith('_mcp_') or _mcp_n.startswith('__'):
-            continue
-        if _mcp_n in _MCP_IPYTHON_INJECTED:
-            continue
-        if not _include_private and _mcp_n.startswith('_'):
-            continue
+# Everything the helpers inject is wrapped in a single zero-arg function so
+# the kernel-side namespace only ever gains ``_mcp_run`` (which we delete in
+# the finally block). No more orphan ``_mcp_payload`` / ``_MCP_IPYTHON_INJECTED``
+# / etc. in the user's globals.
+_HELPER_PROLOGUE = f"""
+def _mcp_run():
+    import json as _mcp_json, sys as _mcp_sys
+    _MCP_IPYTHON_INJECTED = {{
+        'In', 'Out', 'get_ipython', 'exit', 'quit', 'open',
+        'PS1', 'REPLHooks', 'get_last_command', 'is_wsl', 'original_ps1',
+        'readline', 'platform', 'sys',
+    }}
+    def _mcp_safe(x):
+        # json fallback for objects we can't otherwise encode (numpy scalars,
+        # pandas Timestamps, Decimal, sets, bytes, Path, ...). Avoids the
+        # whole inspection silently reporting found=False.
         try:
-            _mcp_tname = type(_mcp_v).__name__
-        except Exception:
-            _mcp_tname = '?'
-        _mcp_size = ''
-        try:
-            if hasattr(_mcp_v, 'shape'):
-                _mcp_size = 'shape=' + repr(tuple(_mcp_v.shape))
-            elif hasattr(_mcp_v, '__len__') and not isinstance(_mcp_v, str):
-                _mcp_size = 'len=' + str(len(_mcp_v))
-            elif isinstance(_mcp_v, str):
-                _mcp_size = 'len=' + str(len(_mcp_v))
+            import numpy as _np
+            if isinstance(x, (_np.integer,)): return int(x)
+            if isinstance(x, (_np.floating,)):
+                v = float(x)
+                return None if v != v else v
+            if isinstance(x, (_np.bool_,)): return bool(x)
+            if isinstance(x, _np.ndarray): return x.tolist()
         except Exception:
             pass
+        if isinstance(x, (set, frozenset)): return list(x)
+        if isinstance(x, (bytes, bytearray)):
+            try: return x.decode('utf-8', 'replace')
+            except Exception: return repr(x)
         try:
-            _mcp_r = repr(_mcp_v)
-        except Exception as _mcp_e:
-            _mcp_r = '<repr failed: ' + repr(_mcp_e) + '>'
-        if len(_mcp_r) > 200:
-            _mcp_r = _mcp_r[:199] + '…'
-        _mcp_out.append({'name': _mcp_n, 'type': _mcp_tname, 'size_hint': _mcp_size, 'repr_preview': _mcp_r})
-    _mcp_out.sort(key=lambda d: d['name'])
-    return _mcp_out
+            return str(x)
+        except Exception:
+            return repr(x)
+    def _list_vars(_include_private):
+        _out = []
+        _g = dict(globals())
+        for _n, _v in _g.items():
+            if _n.startswith('_mcp_') or _n.startswith('__'):
+                continue
+            if _n == '_MCP_IPYTHON_INJECTED' or _n == '_mcp_run':
+                continue
+            if _n in _MCP_IPYTHON_INJECTED:
+                continue
+            if not _include_private and _n.startswith('_'):
+                continue
+            try: _tname = type(_v).__name__
+            except Exception: _tname = '?'
+            _size = ''
+            try:
+                if hasattr(_v, 'shape'):
+                    _size = 'shape=' + repr(tuple(_v.shape))
+                elif hasattr(_v, '__len__') and not isinstance(_v, str):
+                    _size = 'len=' + str(len(_v))
+                elif isinstance(_v, str):
+                    _size = 'len=' + str(len(_v))
+            except Exception:
+                pass
+            try: _r = repr(_v)
+            except Exception as _e: _r = '<repr failed: ' + repr(_e) + '>'
+            if len(_r) > 200:
+                _r = _r[:199] + '…'
+            _out.append({{'name': _n, 'type': _tname, 'size_hint': _size, 'repr_preview': _r}})
+        _out.sort(key=lambda d: d['name'])
+        return _out
+    def _inspect(_name, _max_repr):
+        _g = globals()
+        if _name not in _g:
+            return {{'found': False, 'name': _name}}
+        _v = _g[_name]
+        _info = {{'found': True, 'name': _name, 'type': type(_v).__name__}}
+        try: _r = repr(_v)
+        except Exception as _e: _r = '<repr failed: ' + repr(_e) + '>'
+        if len(_r) > _max_repr:
+            _r = _r[:_max_repr - 1] + '…'
+        _info['repr'] = _r
+        if hasattr(_v, 'shape'):
+            try: _info['shape'] = list(_v.shape)
+            except Exception: pass
+        if hasattr(_v, 'dtype'):
+            try: _info['dtype'] = str(_v.dtype)
+            except Exception: pass
+        if hasattr(_v, 'dtypes') and hasattr(_v, 'columns'):
+            try: _info['columns'] = list(map(str, _v.columns))
+            except Exception: pass
+            try: _info['dtypes_per_column'] = {{str(k): str(_v.dtypes[k]) for k in _v.columns}}
+            except Exception: pass
+            try:
+                _head = _v.head(5).to_dict(orient='list')
+                _head = {{str(k): [(None if (isinstance(x, float) and (x != x)) else x) for x in vs] for k, vs in _head.items()}}
+                _info['head'] = _head
+            except Exception: pass
+        elif hasattr(_v, '__len__') and not isinstance(_v, (str, bytes)):
+            try: _info['length'] = len(_v)
+            except Exception: pass
+        return _info
+    return _list_vars, _inspect, _mcp_safe, _mcp_json, _mcp_sys
 """
+
+
+def _wrap_call(payload_expr: str) -> str:
+    """Run the helper, emit sentinel-wrapped JSON, then clean up globals."""
+    return (
+        _HELPER_PROLOGUE
+        + f"""
+try:
+    _list_vars, _inspect, _safe, _json, _sysmod = _mcp_run()
+    _payload = {payload_expr}
+    _sysmod.stdout.write('{_SENTINEL}' + _json.dumps(_payload, default=_safe) + '{_SENTINEL}')
+    _sysmod.stdout.flush()
+finally:
+    for _n in ('_mcp_run', '_list_vars', '_inspect', '_safe', '_json',
+               '_sysmod', '_payload'):
+        globals().pop(_n, None)
+"""
+    )
 
 
 def _list_vars_code(include_private: bool) -> str:
     flag = "True" if include_private else "False"
-    return _LIST_VARS_BODY + _wrap(f"_mcp_list_vars({flag})")
+    return _wrap_call(f"_list_vars({flag})")
 
 
 def _inspect_var_code(name: str, max_repr_len: int) -> str:
     safe_name = json.dumps(name)
-    return (
-        _LIST_VARS_BODY
-        + f"""
-def _mcp_inspect(_name, _max_repr):
-    _mcp_g = globals()
-    if _name not in _mcp_g:
-        return {{'found': False, 'name': _name}}
-    _v = _mcp_g[_name]
-    _info = {{'found': True, 'name': _name, 'type': type(_v).__name__}}
-    try:
-        _r = repr(_v)
-    except Exception as _e:
-        _r = '<repr failed: ' + repr(_e) + '>'
-    if len(_r) > _max_repr:
-        _r = _r[:_max_repr - 1] + '…'
-    _info['repr'] = _r
-    if hasattr(_v, 'shape'):
-        try: _info['shape'] = list(_v.shape)
-        except Exception: pass
-    if hasattr(_v, 'dtype'):
-        try: _info['dtype'] = str(_v.dtype)
-        except Exception: pass
-    if hasattr(_v, 'dtypes') and hasattr(_v, 'columns'):
-        try: _info['columns'] = list(map(str, _v.columns))
-        except Exception: pass
-        try: _info['dtypes_per_column'] = {{str(k): str(_v.dtypes[k]) for k in _v.columns}}
-        except Exception: pass
-        try:
-            _head = _v.head(5).to_dict(orient='list')
-            _head = {{str(k): [None if (isinstance(x, float) and (x != x)) else x for x in vs] for k, vs in _head.items()}}
-            _info['head'] = _head
-        except Exception: pass
-    elif hasattr(_v, '__len__') and not isinstance(_v, (str, bytes)):
-        try: _info['length'] = len(_v)
-        except Exception: pass
-    return _info
-"""
-        + _wrap(f"_mcp_inspect({safe_name}, {int(max_repr_len)})")
-    )
+    return _wrap_call(f"_inspect({safe_name}, {int(max_repr_len)})")
 
 
 async def _execute_capture(

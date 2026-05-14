@@ -123,45 +123,62 @@ class JupyterServer:
             "server",
             "--no-browser",
             f"--ServerApp.port={self.port}",
-            f"--ServerApp.token={self.token}",
             f"--ServerApp.root_dir={self.root_dir}",
+            # Jupyter 2.x moved auth into IdentityProvider; ServerApp.token is
+            # accepted but logs a deprecation warning. Set both so we keep
+            # working on either side of the rename.
+            f"--IdentityProvider.token={self.token}",
+            f"--ServerApp.token={self.token}",
             "--ServerApp.disable_check_xsrf=True",
             "--ServerApp.allow_origin=*",
             "--ServerApp.password=",
             "--ServerApp.open_browser=False",
             "--ServerApp.answer_yes=True",
-            # Don't accept signals from CTRL-C in the parent: we'll terminate
-            # the subprocess ourselves.
         ]
+        # `jupyter server` refuses to run as root by default. This matters for
+        # Docker, Codespaces, devcontainers, CI, etc. Add --allow-root only
+        # when we genuinely are root, and gate the geteuid call on POSIX so
+        # Windows doesn't crash on the attribute access.
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            cmd.append("--allow-root")
         env = dict(os.environ)
-        # Don't let JUPYTER_RUNTIME_DIR collisions confuse the runtime path.
-        self.proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-        )
-        self._stderr_task = asyncio.create_task(self._drain_stderr())
+        try:
+            self.proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            self._stderr_task = asyncio.create_task(self._drain_stderr())
 
-        # Wait for /api/status to answer.
-        deadline = asyncio.get_event_loop().time() + SERVER_STARTUP_TIMEOUT_S
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            while asyncio.get_event_loop().time() < deadline:
-                if self.proc.returncode is not None:
-                    raise RuntimeError(
-                        f"jupyter server exited during startup with code {self.proc.returncode}"
-                    )
-                try:
-                    r = await client.get(f"{self.url}/api/status", headers=self.headers)
-                    if r.status_code == 200:
-                        await self._write_connection_file()
-                        return
-                except Exception:
-                    pass
-                await asyncio.sleep(0.25)
-        raise TimeoutError(
-            f"jupyter server didn't answer at {self.url} within {SERVER_STARTUP_TIMEOUT_S}s"
-        )
+            # Wait for /api/status to answer.
+            deadline = asyncio.get_event_loop().time() + SERVER_STARTUP_TIMEOUT_S
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                while asyncio.get_event_loop().time() < deadline:
+                    if self.proc.returncode is not None:
+                        raise RuntimeError(
+                            f"jupyter server exited during startup with code {self.proc.returncode}"
+                        )
+                    try:
+                        r = await client.get(
+                            f"{self.url}/api/status", headers=self.headers
+                        )
+                        if r.status_code == 200:
+                            await self._write_connection_file()
+                            return
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.25)
+            raise TimeoutError(
+                f"jupyter server didn't answer at {self.url} within {SERVER_STARTUP_TIMEOUT_S}s"
+            )
+        except BaseException:
+            # If startup fails partway, the subprocess + stderr drain task
+            # would otherwise leak. Clean up before re-raising so retries
+            # aren't poisoned by stale state.
+            with contextlib.suppress(Exception):
+                await self.stop()
+            raise
 
     async def stop(self) -> None:
         if self.proc is None:

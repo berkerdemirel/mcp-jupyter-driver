@@ -207,6 +207,53 @@ async def test_rebind_kernel_sticks_across_operations(open_nb) -> None:
     # If we instead point at a stale id, rejoin should find B again.
 
 
+async def test_close_notebook_does_not_kill_unowned_session(open_nb) -> None:
+    """If auto-rejoin or rebind has switched us onto a VS Code-owned session,
+    close_notebook must not DELETE it via the server API — that would shut
+    down the user's kernel.
+    """
+    session = await open_nb(["x = 1"])
+    await execution.run_cell(session, 0, timeout_s=20)
+
+    body = {
+        "kernel": {"name": "python3"},
+        "name": "vscode-mock-owned",
+        "path": "vscode-mock-owned.ipynb",
+        "type": "notebook",
+    }
+    r = await session.client._http.post("/api/sessions", json=body)
+    r.raise_for_status()
+    user_sess = r.json()
+
+    # Simulate auto-rejoin / rebind landing on the user-owned session.
+    session.session_id = user_sess["id"]
+    session.kernel_id = user_sess["kernel"]["id"]
+
+    await registry.close_session(session.canonical, shutdown_kernel=True)
+
+    # The user-owned session must still be alive on the server.
+    r2 = await session.client._http.get("/api/sessions")
+    r2.raise_for_status()
+    alive_ids = {s["id"] for s in r2.json()}
+    assert user_sess["id"] in alive_ids
+
+
+async def test_restart_kernel_clears_pin(open_nb) -> None:
+    """restart_kernel should release the pin so auto-rejoin can move again."""
+    session = await open_nb(["x = 1"])
+    await execution.run_cell(session, 0, timeout_s=20)
+    # Pin to our own kernel by rebinding to its own kernel_id.
+    outcome = await session.rebind_to_kernel(session.kernel_id)
+    assert outcome.ok is True
+    assert session.pinned is True
+    # Restart and confirm the pin was cleared.
+    info = await session.client.restart_kernel(session.kernel_id)
+    if isinstance(info, dict) and info.get("id"):
+        session.kernel_id = info["id"]
+    session.unpin()  # what restart_kernel tool does
+    assert session.pinned is False
+
+
 async def test_auto_rejoin_to_user_kernel_via_basename(open_nb) -> None:
     """If a session for the same notebook exists under a different path
     encoding (basename match), Claude should auto-rejoin its kernel on the

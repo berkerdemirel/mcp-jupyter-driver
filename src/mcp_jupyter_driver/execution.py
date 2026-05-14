@@ -45,6 +45,10 @@ class CellResult:
     truncated: bool = False
     interactive_input: bool = False
     kernel_restarted: bool = False
+    # Set when we returned because the timeout fired but the kernel is still
+    # running. Callers should call interrupt_kernel or accept that subsequent
+    # outputs may keep arriving on the live kernel.
+    kernel_still_running: bool = False
 
 
 # ---- output helpers (pure, unit-testable) -----------------------------------
@@ -60,6 +64,25 @@ def _truncate_str(s: str, limit: int = MAX_OUTPUT_BYTES) -> str:
     return s[: limit - len(_TRUNCATED)] + _TRUNCATED
 
 
+# MIME types that don't count toward the cell-size cap. Binary images can be
+# large but they're the whole point of displaying a plot, and widget MIME is
+# small JSON but uncapping it keeps interactive widgets faithful.
+_EXEMPT_MIME_PREFIXES: tuple[str, ...] = ("image/",)
+_EXEMPT_MIME_TYPES = {
+    "application/vnd.jupyter.widget-view+json",
+    "application/vnd.jupyter.widget-state+json",
+}
+
+
+def _is_exempt_mime(mime: str) -> bool:
+    if mime in _EXEMPT_MIME_TYPES:
+        return True
+    for pref in _EXEMPT_MIME_PREFIXES:
+        if mime.startswith(pref):
+            return True
+    return False
+
+
 def _output_size(out: NotebookNode) -> int:
     otype = out.get("output_type")
     if otype == "stream":
@@ -67,7 +90,9 @@ def _output_size(out: NotebookNode) -> int:
         return len("".join(text) if isinstance(text, list) else text)
     if otype in ("display_data", "execute_result", "update_display_data"):
         total = 0
-        for v in (out.get("data") or {}).values():
+        for k, v in (out.get("data") or {}).items():
+            if _is_exempt_mime(k):
+                continue
             if isinstance(v, list):
                 total += sum(len(x) for x in v if isinstance(x, str))
             elif isinstance(v, str):
@@ -116,9 +141,27 @@ def _coalesce_stream(outputs: list[NotebookNode], new_out: NotebookNode) -> bool
         new_text = new_out.get("text", "")
         if isinstance(new_text, list):
             new_text = "".join(new_text)
-        prev["text"] = prev_text + new_text
+        merged = prev_text + new_text
+        truncated = False
+        if len(merged) > MAX_OUTPUT_BYTES:
+            merged = _truncate_str(merged)
+            truncated = True
+        prev["text"] = merged
+        if truncated:
+            prev["_mcp_truncated"] = True
         return True
     return False
+
+
+def _display_id_of(msg: dict) -> str | None:
+    """display_data/update_display_data carry a display_id in transient.
+
+    We use it to find prior outputs to update — nbformat.output_from_msg
+    doesn't recognize update_display_data on its own.
+    """
+    transient = (msg.get("content", {}) or {}).get("transient") or {}
+    did = transient.get("display_id")
+    return did if isinstance(did, str) and did else None
 
 
 # ---- main entrypoint --------------------------------------------------------
@@ -132,7 +175,12 @@ async def run_cell(
     progress: ProgressCb | None = None,
     restart_on_kernel_death: bool = False,
 ) -> CellResult:
-    """Execute a cell against the shared kernel and write outputs back."""
+    """Execute a cell against the shared kernel and write outputs back.
+
+    Writes are always re-read-then-patch by cell id (falling back to index
+    only when no id is present) so a concurrent VS Code edit during the run
+    can't be clobbered by a stale full-notebook PUT.
+    """
     async with session.exec_lock:
         # If VS Code is using a different kernel for this notebook (or our
         # kernel died), switch to a live one before we run.
@@ -143,9 +191,16 @@ async def run_cell(
         if cell.get("cell_type") != "code":
             return CellResult(status="ok", execution_count=None, output_count=0)
 
-        cell["outputs"] = []
-        cell["execution_count"] = None
-        await session.write_notebook(nb)  # editor shows "running"
+        cell_id = cell.get("id")
+        src = cell.get("source", "")
+        source = "".join(src) if isinstance(src, list) else (src or "")
+
+        # Working copy: list of outputs we'll patch into the on-disk cell.
+        # We never PUT the whole notebook from here — only the target cell.
+        outputs: list[NotebookNode] = []
+        await _flush_cell(
+            session, cell_id, idx, outputs=[], execution_count=None
+        )
 
         try:
             async with session.client.kernel_channel(
@@ -154,7 +209,7 @@ async def run_cell(
                 msg_id = await ch.send(
                     "execute_request",
                     {
-                        "code": cell.get("source", ""),
+                        "code": source,
                         "silent": False,
                         "store_history": True,
                         "user_expressions": {},
@@ -167,13 +222,14 @@ async def run_cell(
                     ch=ch,
                     msg_id=msg_id,
                     session=session,
-                    nb=nb,
-                    cell=cell,
+                    cell_id=cell_id,
+                    fallback_index=idx,
+                    outputs=outputs,
                     timeout_s=timeout_s,
                     progress=progress,
                 )
                 if result.has_widget:
-                    await _snapshot_widgets(ch, nb)
+                    await _snapshot_widgets(session, ch)
         except KernelDiedError:
             if restart_on_kernel_death:
                 try:
@@ -187,9 +243,42 @@ async def run_cell(
                 )
             raise
 
-        # Final write — outputs and execution_count now in place.
-        await session.write_notebook(nb)
+        # Final flush — outputs and execution_count now in place.
+        await _flush_cell(
+            session,
+            cell_id,
+            idx,
+            outputs=outputs,
+            execution_count=result.execution_count,
+        )
         return result
+
+
+async def _flush_cell(
+    session: NotebookSession,
+    cell_id: str | None,
+    fallback_index: int,
+    *,
+    outputs: list[NotebookNode],
+    execution_count: int | None,
+) -> None:
+    """Read fresh, patch only the target cell's outputs+execution_count, write."""
+
+    def _apply(c: dict) -> None:
+        if c.get("cell_type") != "code":
+            return
+        c["outputs"] = list(outputs)
+        c["execution_count"] = execution_count
+
+    try:
+        await session.patch_cell(
+            cell_id=cell_id, fallback_index=fallback_index, mutate=_apply
+        )
+    except Exception:
+        # Best-effort during streaming writes. The final flush after the cell
+        # completes will retry; if that also fails, the caller's
+        # write_notebook exception propagates.
+        pass
 
 
 async def _consume(
@@ -197,8 +286,9 @@ async def _consume(
     ch,
     msg_id: str,
     session: NotebookSession,
-    nb: dict,
-    cell: dict,
+    cell_id: str | None,
+    fallback_index: int,
+    outputs: list[NotebookNode],
     timeout_s: float,
     progress: ProgressCb | None,
 ) -> CellResult:
@@ -209,20 +299,33 @@ async def _consume(
     truncation_marker_added = False
     saw_idle = False
     shell_reply_seen = False
+    # display_id -> index in outputs (for update_display_data).
+    display_ids: dict[str, int] = {}
+    # If clear_output(wait=True) was requested, clear before the next output.
+    clear_pending = False
+
+    def _do_clear() -> None:
+        nonlocal cell_bytes, truncation_marker_added
+        outputs.clear()
+        display_ids.clear()
+        cell_bytes = 0
+        truncation_marker_added = False
 
     while not (saw_idle and shell_reply_seen):
         if asyncio.get_event_loop().time() > deadline:
-            cell["outputs"].append(
+            outputs.append(
                 nbformat.v4.new_output(
                     output_type="stream",
                     name="stderr",
                     text=f"\n[mcp-jupyter-driver] cell timed out after {timeout_s:.0f}s; "
-                    f"call interrupt_kernel to stop the kernel.\n",
+                    f"kernel is still running — call interrupt_kernel to stop it.\n",
                 )
             )
             result.status = "error"
             result.error_name = "Timeout"
             result.error_value = "cell execution exceeded timeout_s"
+            result.kernel_still_running = True
+            result.output_count = len(outputs)
             return result
 
         try:
@@ -231,7 +334,7 @@ async def _consume(
             try:
                 await session.client.get_kernel(session.kernel_id)
             except Exception:
-                cell["outputs"].append(
+                outputs.append(
                     nbformat.v4.new_output(
                         output_type="error",
                         ename="KernelDied",
@@ -242,7 +345,11 @@ async def _consume(
                 result.status = "kernel_died"
                 result.error_name = "KernelDied"
                 result.error_value = "kernel exited during execution"
-                await session.write_notebook(nb)
+                result.output_count = len(outputs)
+                await _flush_cell(
+                    session, cell_id, fallback_index,
+                    outputs=outputs, execution_count=result.execution_count,
+                )
                 raise KernelDiedError(session.canonical)
             continue
 
@@ -255,15 +362,12 @@ async def _consume(
 
         if channel == "stdin":
             if mt == "input_request":
-                # Auto-reply empty so the cell doesn't hang.
                 try:
                     await ch.send(
                         "input_reply", {"value": ""}, channel="stdin"
                     )
                 except Exception:
                     pass
-                # We have to surface this to the caller; set a marker by
-                # appending a stderr note. The caller checks result.interactive_input.
                 result.interactive_input = True
             continue
 
@@ -272,7 +376,12 @@ async def _consume(
                 shell_reply_seen = True
                 if content.get("execution_count") is not None:
                     result.execution_count = content["execution_count"]
-                    cell["execution_count"] = content["execution_count"]
+                # Use shell reply as fallback when iopub error was missed.
+                if content.get("status") == "error" and result.status != "error":
+                    result.status = "error"
+                    result.error_name = content.get("ename")
+                    result.error_value = content.get("evalue")
+                    result.error_traceback = list(content.get("traceback") or [])
             continue
 
         # channel == "iopub" (or unspecified)
@@ -285,19 +394,54 @@ async def _consume(
             count = content.get("execution_count")
             if count is not None:
                 result.execution_count = count
-                cell["execution_count"] = count
             continue
 
         if mt in ("comm_open", "comm_msg", "comm_close"):
             continue
 
-        if mt in (
-            "stream",
-            "display_data",
-            "execute_result",
-            "error",
-            "update_display_data",
-        ):
+        if mt == "clear_output":
+            if content.get("wait"):
+                clear_pending = True
+            else:
+                _do_clear()
+                clear_pending = False
+            continue
+
+        if mt == "update_display_data":
+            did = _display_id_of(msg)
+            if did is None or did not in display_ids:
+                # No prior matching display — nothing to do.
+                continue
+            try:
+                refreshed = nbformat.v4.new_output(
+                    output_type="display_data",
+                    data=dict(content.get("data") or {}),
+                    metadata=dict(content.get("metadata") or {}),
+                )
+            except Exception:
+                continue
+            if _cap_output(refreshed):
+                result.truncated = True
+            target_idx = display_ids[did]
+            prev = outputs[target_idx]
+            cell_bytes = max(0, cell_bytes - _output_size(prev))
+            outputs[target_idx] = refreshed
+            cell_bytes += _output_size(refreshed)
+            now = time.monotonic()
+            if now - last_write >= WRITE_DEBOUNCE_S:
+                last_write = now
+                await _flush_cell(
+                    session, cell_id, fallback_index,
+                    outputs=outputs, execution_count=result.execution_count,
+                )
+            continue
+
+        if mt in ("stream", "display_data", "execute_result", "error"):
+            # Honor pending clear (wait=True) right before adding the next output.
+            if clear_pending:
+                _do_clear()
+                clear_pending = False
+
             try:
                 out = nbformat.v4.output_from_msg(msg)
             except Exception:
@@ -305,26 +449,45 @@ async def _consume(
 
             if cell_bytes >= MAX_CELL_BYTES:
                 if not truncation_marker_added:
-                    cell["outputs"].append(
+                    outputs.append(
                         nbformat.v4.new_output(
                             output_type="stream", name="stderr", text=_TRUNCATED
                         )
                     )
                     truncation_marker_added = True
                     result.truncated = True
+                # Drop the over-cap output entirely so we honor the documented cap.
                 continue
 
             if _cap_output(out):
                 result.truncated = True
             this_size = _output_size(out)
             if cell_bytes + this_size > MAX_CELL_BYTES:
+                # Don't append an output that would push us over. Insert the
+                # truncation marker instead and stop accepting more.
+                if not truncation_marker_added:
+                    outputs.append(
+                        nbformat.v4.new_output(
+                            output_type="stream", name="stderr", text=_TRUNCATED
+                        )
+                    )
+                    truncation_marker_added = True
                 result.truncated = True
+                continue
 
             if mt == "stream":
-                if not _coalesce_stream(cell["outputs"], out):
-                    cell["outputs"].append(out)
+                if not _coalesce_stream(outputs, out):
+                    outputs.append(out)
+                # After (possible) coalesce, the merged last output may have
+                # been capped — reflect that in result.truncated.
+                if outputs and outputs[-1].pop("_mcp_truncated", False):
+                    result.truncated = True
             else:
-                cell["outputs"].append(out)
+                outputs.append(out)
+                if mt == "display_data":
+                    did = _display_id_of(msg)
+                    if did is not None:
+                        display_ids[did] = len(outputs) - 1
 
             cell_bytes += this_size
 
@@ -337,15 +500,15 @@ async def _consume(
             if widgets.outputs_contain_widget([out]):
                 result.has_widget = True
 
-            result.output_count = len(cell["outputs"])
+            result.output_count = len(outputs)
 
             now = time.monotonic()
             if now - last_write >= WRITE_DEBOUNCE_S:
                 last_write = now
-                try:
-                    await session.write_notebook(nb)
-                except Exception:
-                    pass
+                await _flush_cell(
+                    session, cell_id, fallback_index,
+                    outputs=outputs, execution_count=result.execution_count,
+                )
 
             if progress is not None:
                 try:
@@ -357,11 +520,16 @@ async def _consume(
                     pass
             continue
 
+    result.output_count = len(outputs)
     return result
 
 
-async def _snapshot_widgets(ch, nb: dict) -> None:
-    """Run silent helper on the existing channel; install state into nb.metadata."""
+async def _snapshot_widgets(session: NotebookSession, ch) -> None:
+    """Run silent helper on the existing channel; install state into nb.metadata.
+
+    Reads the latest notebook back from the server before writing so a
+    concurrent VS Code edit doesn't get clobbered.
+    """
     msg_id = await ch.send(
         "execute_request",
         {
@@ -400,5 +568,8 @@ async def _snapshot_widgets(ch, nb: dict) -> None:
             saw_idle = True
 
     snapshot = widgets.parse_snapshot_stdout("".join(collected))
-    if snapshot is not None:
-        widgets.install_widget_state(nb.setdefault("metadata", {}), snapshot)
+    if snapshot is None:
+        return
+    fresh = await session.read_notebook()
+    widgets.install_widget_state(fresh.setdefault("metadata", {}), snapshot)
+    await session.write_notebook(fresh)

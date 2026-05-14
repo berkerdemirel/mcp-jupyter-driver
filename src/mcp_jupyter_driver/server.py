@@ -143,6 +143,12 @@ class JupyterSessionInfo(BaseModel):
     path: str
     kernel_state: str
     is_claudes: bool = False
+    owned_by_claude: bool = False
+    # How this session would be discovered if ``path`` was queried via
+    # auto-rejoin: "exact_path", "vscode_synthetic", "basename", or
+    # "no_match". Only set when the caller passed ``path`` to
+    # ``list_jupyter_sessions``.
+    match_reason: str = ""
 
 
 class RebindResult(BaseModel):
@@ -150,6 +156,7 @@ class RebindResult(BaseModel):
     new_kernel_id: str | None = None
     new_session_id: str | None = None
     note: str = ""
+    candidates: list[dict] = Field(default_factory=list)
 
 
 # ----- helpers ---------------------------------------------------------------
@@ -264,35 +271,66 @@ async def list_kernelspecs() -> list[str]:
 async def list_jupyter_sessions(path: str | None = None) -> list[JupyterSessionInfo]:
     """List every session/kernel currently running on the local Jupyter Server.
 
-    If `path` is given, only sessions for that notebook path. Useful for
-    diagnosing kernel-sharing issues: if you and Claude see different
-    kernel_ids for the same notebook, you're not sharing state. Fix with
-    `rebind_kernel` or by picking the running kernel in VS Code's picker.
+    When ``path`` is given, every session is returned (no filtering) with a
+    ``match_reason`` field describing how auto-rejoin sees it:
+
+    - ``exact_path`` — server path equals the resolved ``server_relative``.
+    - ``vscode_synthetic`` — VS Code's ``<stem>-jvsc-<uuid>-<uuid>.ipynb``.
+    - ``basename`` — only basenames match (cross-directory; auto-rejoin
+      uses this fallback only when it's unique).
+    - ``no_match`` — auto-rejoin would ignore this session for ``path``.
+
+    ``is_claudes`` is set by matching the MCP-side binding's session_id or
+    kernel_id, not the path, so it stays correct after ``rebind_kernel``.
+    ``owned_by_claude`` is set only for sessions Claude created (and may
+    safely shut down).
     """
     client = await registry.get_client()
     sessions = await client.list_sessions()
+
+    bound_session_ids = {s.session_id for s in registry.list_sessions()}
+    bound_kernel_ids = {s.kernel_id for s in registry.list_sessions()}
+    owned_session_ids: set[str] = set()
+    for s in registry.list_sessions():
+        owned_session_ids |= s.owned_session_ids
+
+    match_reasons: dict[str, str] = {}
+    if path is not None:
+        from pathlib import Path as _P
+        from .session import server_path
+
+        target = server_path(path)
+        basename = _P(target).name
+        stem = _P(basename).stem
+        synthetic_prefix = f"{stem}-jvsc-"
+        for s in sessions:
+            sess_path = s.get("path") or ""
+            name = _P(sess_path).name
+            if sess_path == target:
+                match_reasons[s["id"]] = "exact_path"
+            elif name.startswith(synthetic_prefix):
+                match_reasons[s["id"]] = "vscode_synthetic"
+            elif name == basename:
+                match_reasons[s["id"]] = "basename"
+            else:
+                match_reasons[s["id"]] = "no_match"
+
     out: list[JupyterSessionInfo] = []
-    # Build a map of (path -> claude's bound kernel_id) so we can mark our own.
-    claudes_bindings: dict[str, str] = {
-        s.server_relative: s.kernel_id for s in registry.list_sessions()
-    }
     for s in sessions:
         sess_path = s.get("path") or ""
-        if path is not None:
-            from .session import server_path
-
-            if sess_path != server_path(path):
-                continue
         kid = s["kernel"]["id"]
         state = s["kernel"].get("execution_state", "unknown")
+        sid = s["id"]
         out.append(
             JupyterSessionInfo(
-                session_id=s["id"],
+                session_id=sid,
                 kernel_id=kid,
                 kernel_name=s["kernel"]["name"],
                 path=sess_path,
                 kernel_state=state,
-                is_claudes=claudes_bindings.get(sess_path) == kid,
+                is_claudes=sid in bound_session_ids or kid in bound_kernel_ids,
+                owned_by_claude=sid in owned_session_ids,
+                match_reason=match_reasons.get(sid, ""),
             )
         )
     return out
@@ -302,19 +340,29 @@ async def list_jupyter_sessions(path: str | None = None) -> list[JupyterSessionI
 async def rebind_kernel(path: str, target: str) -> RebindResult:
     """Switch Claude's notebook binding to a specific kernel/session, and pin.
 
-    `target` can be a session_id, a kernel_id, or a kernel_id prefix (8 chars
-    is plenty). After a rebind, auto-rejoin will not undo your choice — you
-    can call `unpin_kernel` to let it reconsider, or `rebind_kernel` again to
-    pick a different one.
+    `target` must be an exact session_id, an exact kernel_id, or a kernel_id
+    prefix of at least 8 characters. Empty / overly-short prefixes are
+    rejected, and an ambiguous match returns the candidate list so the caller
+    can disambiguate. After a successful rebind, auto-rejoin will not undo
+    your choice — call `unpin_kernel` to let it reconsider, or
+    `rebind_kernel` again to pick a different one.
     """
     session = registry.get_session(path)
     async with session.exec_lock:
         old_kid = session.kernel_id
-        ok = await session.rebind_to_kernel(target)
-    if not ok:
+        outcome = await session.rebind_to_kernel(target)
+    if not outcome.ok:
+        notes = {
+            "empty": "target must be a non-empty session_id, kernel_id, or kernel_id prefix.",
+            "too_short": outcome.detail or "target prefix is too short; pass at least 8 characters.",
+            "not_found": f"No session found matching {target!r}. Call list_jupyter_sessions to see what's available.",
+            "ambiguous": f"Target {target!r} matched multiple sessions; pass a more specific id (see candidates).",
+            "dead": "Target kernel exists but isn't alive. Restart it from VS Code or pick a different one.",
+        }
         return RebindResult(
             rebound=False,
-            note=f"No session found matching {target!r}. Call list_jupyter_sessions to see what's available.",
+            note=notes.get(outcome.reason, ""),
+            candidates=outcome.candidates,
         )
     if session.kernel_id == old_kid:
         return RebindResult(
@@ -615,8 +663,18 @@ async def complete(path: str, source: str, cursor_pos: int) -> CompletionResult:
 
 @mcp.tool()
 async def kernel_status(path: str) -> NotebookHandle:
-    """Status of the shared kernel for this notebook."""
+    """Status of the shared kernel for this notebook.
+
+    Calls ``maybe_rejoin`` first so the reported binding reflects what the
+    next ``run_cell`` would use — without this, status could report Claude's
+    stored kernel right before execution silently switches to VS Code's.
+    """
     session = registry.get_session(path)
+    try:
+        await session.maybe_rejoin()
+    except Exception:
+        # Auto-rejoin is best-effort; never block status on its failure.
+        pass
     return await _to_handle(session)
 
 
@@ -630,10 +688,25 @@ async def interrupt_kernel(path: str) -> OkResult:
 
 @mcp.tool()
 async def restart_kernel(path: str, clear_outputs: bool = False) -> NotebookHandle:
-    """Restart the shared kernel. If clear_outputs is true, wipe cell outputs too."""
+    """Restart the shared kernel and refresh local binding.
+
+    Also unpins the binding so auto-rejoin can move it again if the user
+    re-attaches a different kernel in VS Code; restart is a clean slate.
+    If ``clear_outputs`` is true, wipe cell outputs too.
+    """
     session = registry.get_session(path)
     async with session.exec_lock:
-        await session.client.restart_kernel(session.kernel_id)
+        info = await session.client.restart_kernel(session.kernel_id)
+        # Restart usually returns the same kernel id, but pick up whatever
+        # the server reports rather than trusting our cached value.
+        if isinstance(info, dict):
+            kid = info.get("id")
+            if isinstance(kid, str) and kid:
+                session.kernel_id = kid
+            kname = info.get("name")
+            if isinstance(kname, str) and kname:
+                session.kernel_name = kname
+        session.unpin()
         if clear_outputs:
             nb = await session.read_notebook()
             for cell in nb.get("cells") or []:
