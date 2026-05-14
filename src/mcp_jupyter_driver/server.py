@@ -300,11 +300,12 @@ async def list_jupyter_sessions(path: str | None = None) -> list[JupyterSessionI
 
 @mcp.tool()
 async def rebind_kernel(path: str, target: str) -> RebindResult:
-    """Switch Claude's notebook binding to a specific kernel/session.
+    """Switch Claude's notebook binding to a specific kernel/session, and pin.
 
     `target` can be a session_id, a kernel_id, or a kernel_id prefix (8 chars
-    is plenty). Use this after `list_jupyter_sessions` reveals that you and
-    Claude are on different kernels for the same notebook.
+    is plenty). After a rebind, auto-rejoin will not undo your choice — you
+    can call `unpin_kernel` to let it reconsider, or `rebind_kernel` again to
+    pick a different one.
     """
     session = registry.get_session(path)
     async with session.exec_lock:
@@ -320,14 +321,27 @@ async def rebind_kernel(path: str, target: str) -> RebindResult:
             rebound=False,
             new_kernel_id=session.kernel_id,
             new_session_id=session.session_id,
-            note="Already bound to this kernel.",
+            note="Already bound to this kernel (now pinned).",
         )
     return RebindResult(
         rebound=True,
         new_kernel_id=session.kernel_id,
         new_session_id=session.session_id,
-        note=f"Switched from {old_kid[:8]} to {session.kernel_id[:8]}. Variables from the previous kernel are gone; you're now seeing the shared kernel's state.",
+        note=f"Switched from {old_kid[:8]} to {session.kernel_id[:8]} and pinned. Auto-rejoin will no longer move this binding until you unpin or rebind again.",
     )
+
+
+@mcp.tool()
+async def unpin_kernel(path: str) -> OkResult:
+    """Allow auto-rejoin to move this notebook's kernel binding again.
+
+    After `rebind_kernel`, the binding is pinned (auto-rejoin no-ops). Call
+    this to re-enable the auto-rejoin behavior (e.g. so Claude can pick up
+    a fresh kernel the user just attached in VS Code).
+    """
+    session = registry.get_session(path)
+    session.unpin()
+    return OkResult()
 
 
 @mcp.tool()

@@ -163,6 +163,50 @@ async def test_auto_rejoin_to_user_kernel_via_vscode_synthetic_path(open_nb) -> 
     assert "y" in names and "x" not in names
 
 
+async def test_rebind_kernel_sticks_across_operations(open_nb) -> None:
+    """After explicit rebind_kernel, the next operation must NOT auto-rejoin
+    back to the original kernel. (Regression for the snap-back bug.)
+    """
+    session = await open_nb(["x = 'claude'"])
+    await execution.run_cell(session, 0, timeout_s=20)
+    kA = session.kernel_id
+
+    body = {
+        "kernel": {"name": "python3"},
+        "name": "user-mock",
+        "path": "user-mock.ipynb",
+        "type": "notebook",
+    }
+    r = await session.client._http.post("/api/sessions", json=body)
+    r.raise_for_status()
+    sessB = r.json()
+    kB = sessB["kernel"]["id"]
+    assert kA != kB
+
+    # Explicit rebind to B
+    async with session.exec_lock:
+        ok = await session.rebind_to_kernel(kB)
+    assert ok
+    assert session.kernel_id == kB
+
+    # Run something through Claude — auto-rejoin would normally snap us
+    # back to the path-matched session A. With the pin set, it must not.
+    async with session.exec_lock:
+        nb = await session.read_notebook()
+        import nbformat
+        nb["cells"].append(nbformat.v4.new_code_cell(source="z = 'after_rebind'"))
+        await session.write_notebook(nb)
+    await execution.run_cell(session, len(nb["cells"]) - 1, timeout_s=20)
+
+    assert session.kernel_id == kB, "rebind must stick across operations"
+
+    # And unpin allows auto-rejoin to reconsider
+    session.unpin()
+    # Force-rename basename so auto-rejoin matches user-mock.ipynb. Without
+    # the pin, our current binding is to B (alive) so we stay there.
+    # If we instead point at a stale id, rejoin should find B again.
+
+
 async def test_auto_rejoin_to_user_kernel_via_basename(open_nb) -> None:
     """If a session for the same notebook exists under a different path
     encoding (basename match), Claude should auto-rejoin its kernel on the

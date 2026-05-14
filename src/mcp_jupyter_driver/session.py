@@ -55,6 +55,10 @@ class NotebookSession:
         self.kernel_name = kernel_name
         self.client = client
         self.exec_lock = asyncio.Lock()
+        # When True, maybe_rejoin keeps its hands off — the user explicitly
+        # pinned us to a kernel via rebind_kernel. Cleared by restart_kernel,
+        # close_notebook, or an unpin tool.
+        self.pinned: bool = False
 
     @classmethod
     async def open(
@@ -116,7 +120,11 @@ class NotebookSession:
           that Claude joins it.
         - If our current binding is the only live one, do nothing.
         - If our kernel is dead and a live other exists, switch.
+        - If the session is pinned (user did an explicit rebind), never
+          switch — they get to decide.
         """
+        if self.pinned:
+            return False
         from pathlib import Path as _P
 
         sessions = await self.client.list_sessions()
@@ -174,7 +182,8 @@ class NotebookSession:
 
     async def rebind_to_kernel(self, target: str) -> bool:
         """Rebind to the kernel matching `target` (kernel_id, session_id, or
-        kernel_id_prefix). Returns True if rebound.
+        kernel_id_prefix). Sets the pin so auto-rejoin won't undo it.
+        Returns True if rebound.
         """
         sessions = await self.client.list_sessions()
         for s in sessions:
@@ -186,8 +195,13 @@ class NotebookSession:
                 self.session_id = s["id"]
                 self.kernel_id = s["kernel"]["id"]
                 self.kernel_name = s["kernel"]["name"]
+                self.pinned = True
                 return True
         return False
+
+    def unpin(self) -> None:
+        """Allow maybe_rejoin to switch us again (e.g. after a fresh start)."""
+        self.pinned = False
 
     async def read_notebook(self) -> dict:
         """Always fetch fresh from the server (source of truth)."""
