@@ -110,6 +110,27 @@ the MCP both hit the same kernel. Variables flow between you.
 The URL+token are also written to `~/.cache/mcp-jupyter-driver/connection.json`
 for convenience.
 
+### URL+token are stable across MCP restarts
+
+The token is persisted to `~/.cache/mcp-jupyter-driver/token` (mode 0600) and
+reused on every launch. The port is preferred-then-cached: each launch first
+tries the prior port, then `MCP_JUPYTER_PORT` (default 17077), then a random
+free port — and writes the actually-bound port back to the cache. So once
+you've added the server to VS Code's "Existing Jupyter Server" list, the
+same entry keeps working across Claude restarts.
+
+To rotate the token (e.g., if it ever leaks):
+
+```bash
+rm -f ~/.cache/mcp-jupyter-driver/token
+# next MCP launch generates a fresh one; you'll re-paste once into VS Code.
+```
+
+Override via env vars if you need to:
+
+- `MCP_JUPYTER_CACHE_DIR` — where token + connection.json live (default `~/.cache/mcp-jupyter-driver`).
+- `MCP_JUPYTER_PORT` — preferred port to try first (default `17077`).
+
 ## Tool surface
 
 **Server / lifecycle**
