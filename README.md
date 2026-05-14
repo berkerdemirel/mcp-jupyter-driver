@@ -6,21 +6,23 @@ runs are visible to you. Variables persist in the kernel even if the cell
 that defined them is deleted, because the kernel is shared and decoupled
 from the notebook file.
 
-## Live notebook view sync (real-time collaboration)
+## Notebook view refresh after Claude writes
 
-Cell *outputs* and *structural edits* that Claude writes through the Contents
-API are propagated to your editor in real time via
-[`jupyter-collaboration`](https://github.com/jupyterlab/jupyter-collaboration)
-(Y.js / CRDT). VS Code's Jupyter extension and JupyterLab both support this
-on the client side — they connect to the server's Y.js WebSocket and
-re-render automatically when any other client writes to the notebook.
-
-So when Claude runs a cell, you see the new outputs in the VS Code notebook
-view without doing anything. Same for cells Claude adds, edits, deletes,
-or moves.
+Cell outputs and structural edits Claude makes go through the Jupyter
+Server's Contents API and are written to disk. VS Code's notebook editor
+holds its own in-memory copy and does **not** auto-reload on external file
+changes — so to *see* Claude's updates, run **"File: Revert File"** (or
+"Notebook: Revert") from the command palette.
 
 (Variable sharing through the kernel works regardless — that's the more
-fundamental property of the shared-server architecture, below.)
+fundamental property of the shared-server architecture, below. Use
+`list_variables` / `inspect_variable` to see what's in the kernel without
+needing the notebook UI in sync.)
+
+`jupyter-collaboration` would give true live sync via Y.js, but at present
+its WebSocket flow conflicts with VS Code's Jupyter extension's cell
+execution path, leaving cells stuck. We may revisit when VS Code's
+collaboration support matures.
 
 ## How it works
 
