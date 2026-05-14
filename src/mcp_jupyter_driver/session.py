@@ -27,6 +27,21 @@ def _looks_like_uuid(s: str) -> bool:
     return bool(_UUID_RE.match(s))
 
 
+# The suffix the Jupyter extension appends after "<stem>-jvsc-" is two
+# UUID-like hex sequences joined by hyphens, followed by ".ipynb". We don't
+# want to accept arbitrary "<stem>-jvsc-anything.ipynb" because random files
+# could shadow the synthetic path.
+_VSCODE_SYNTHETIC_SUFFIX_RE = re.compile(r"^[0-9a-fA-F][0-9a-fA-F\-]*\.ipynb$")
+
+
+def is_vscode_synthetic_path(name: str, stem: str) -> bool:
+    """True if ``name`` matches VS Code's ``<stem>-jvsc-<uuid>-<uuid>.ipynb``."""
+    prefix = f"{stem}-jvsc-"
+    if not name.startswith(prefix):
+        return False
+    return bool(_VSCODE_SYNTHETIC_SUFFIX_RE.match(name[len(prefix):]))
+
+
 @dataclass
 class RebindOutcome:
     ok: bool
@@ -180,7 +195,6 @@ class NotebookSession:
         sessions = await self.client.list_sessions()
         basename = _P(self.server_relative).name
         stem = _P(basename).stem
-        vscode_synthetic_prefix = f"{stem}-jvsc-"
 
         seen: set[str] = set()
         exact: list[dict] = []
@@ -195,7 +209,7 @@ class NotebookSession:
             spath_name = _P(spath).name
             if spath == self.server_relative:
                 exact.append(s)
-            elif spath_name.startswith(vscode_synthetic_prefix):
+            elif is_vscode_synthetic_path(spath_name, stem):
                 synthetic.append(s)
             elif spath_name == basename:
                 basename_only.append(s)
@@ -210,16 +224,21 @@ class NotebookSession:
                     pass
             return out
 
-        # If any tier-1/tier-2 candidates exist (alive or not), don't fall
-        # through to the cross-directory basename guess.
+        # Try tiers in order of preference using *alive* candidates only —
+        # a dead exact-path session must NOT block a live synthetic one.
         exact_alive = await _filter_alive(exact)
-        if exact or exact_alive:
+        if exact_alive:
             return self._switch_within_tier(exact_alive)
 
         synthetic_alive = await _filter_alive(synthetic)
-        if synthetic or synthetic_alive:
+        if synthetic_alive:
             return self._switch_within_tier(synthetic_alive)
 
+        # Basename fallback is the cross-directory danger zone. Only allow it
+        # when there are zero exact/synthetic candidates at all (even dead
+        # ones), and only when basename match is unique.
+        if exact or synthetic:
+            return False
         basename_alive = await _filter_alive(basename_only)
         if len(basename_alive) == 1:
             return self._switch_within_tier(basename_alive)
@@ -345,12 +364,16 @@ class NotebookSession:
         """Read the latest notebook from the server, locate one cell, apply
         ``mutate(cell)`` to it, and write back.
 
-        We resolve the cell by stable id first (survives reorder/add/delete
-        from VS Code during execution); fall back to ``fallback_index`` only
-        when no id is present. ``mutate`` runs in-place on the cell dict.
+        Cell location strategy:
+        - If ``cell_id`` is given, look it up by id. If the id has disappeared
+          (e.g. the user deleted the cell from VS Code mid-run), raise
+          ``CellNotFoundError`` — we must NOT silently fall back to
+          ``fallback_index`` and write into a different cell.
+        - If ``cell_id`` is ``None`` (legacy cells without ids), use
+          ``fallback_index`` for the lookup.
 
-        Failing silently here would let an out-of-sync write clobber the
-        user's concurrent edits, so we raise instead.
+        Failing loudly here is intentional: silent fallback is exactly how
+        outputs end up patched into the wrong cell after a concurrent reorder.
         """
         nb = await self.read_notebook()
         cells = nb.get("cells") or []
@@ -360,10 +383,58 @@ class NotebookSession:
                 if c.get("id") == cell_id:
                     idx = i
                     break
-        if idx is None:
-            if fallback_index is not None and 0 <= fallback_index < len(cells):
-                idx = fallback_index
-            else:
-                return
+            if idx is None:
+                raise CellNotFoundError(cell_id)
+        else:
+            if fallback_index is None or not (0 <= fallback_index < len(cells)):
+                raise CellNotFoundError(fallback_index)
+            idx = fallback_index
         mutate(cells[idx])
+        await self.write_notebook(nb)
+
+    async def delete_cell_by_id(self, cell_id: str | None, fallback_index: int) -> None:
+        """Read fresh, drop the target cell, write back.
+
+        Locates by ``cell_id`` (raises ``CellNotFoundError`` if it's gone) so
+        a concurrent VS Code reorder doesn't make us delete a different cell.
+        Falls back to ``fallback_index`` only when no id was available.
+        """
+        nb = await self.read_notebook()
+        cells = nb.get("cells") or []
+        idx: int | None = None
+        if cell_id is not None:
+            for i, c in enumerate(cells):
+                if c.get("id") == cell_id:
+                    idx = i
+                    break
+            if idx is None:
+                raise CellNotFoundError(cell_id)
+        else:
+            if not (0 <= fallback_index < len(cells)):
+                raise CellNotFoundError(fallback_index)
+            idx = fallback_index
+        del cells[idx]
+        await self.write_notebook(nb)
+
+    async def move_cell_by_id(
+        self, cell_id: str | None, fallback_index: int, to_index: int
+    ) -> None:
+        """Read fresh, pop the target cell, insert at ``to_index``, write back."""
+        nb = await self.read_notebook()
+        cells = nb.get("cells") or []
+        idx: int | None = None
+        if cell_id is not None:
+            for i, c in enumerate(cells):
+                if c.get("id") == cell_id:
+                    idx = i
+                    break
+            if idx is None:
+                raise CellNotFoundError(cell_id)
+        else:
+            if not (0 <= fallback_index < len(cells)):
+                raise CellNotFoundError(fallback_index)
+            idx = fallback_index
+        cell = cells.pop(idx)
+        to_idx = max(0, min(to_index, len(cells)))
+        cells.insert(to_idx, cell)
         await self.write_notebook(nb)

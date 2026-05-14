@@ -22,20 +22,28 @@ from typing import Any, Iterable
 WIDGET_VIEW_MIME = "application/vnd.jupyter.widget-view+json"
 WIDGET_STATE_MIME = "application/vnd.jupyter.widget-state+json"
 
+# Run the snapshot inside a function and tear down every name it added to
+# globals afterwards — otherwise users see _mcp_widget_state_snapshot /
+# _mcp_json / _mcp_sys / _mcp_sentinel leaking into the kernel namespace.
 _SNAPSHOT_CODE = """
-def _mcp_widget_state_snapshot():
-    try:
-        from ipywidgets import Widget
-    except Exception:
-        return None
-    try:
-        return Widget.get_manager_state(drop_defaults=True)
-    except Exception as _mcp_e:
-        return {"_mcp_error": repr(_mcp_e)}
-import json as _mcp_json, sys as _mcp_sys
-_mcp_sentinel = "\\x1emcp-widget-state\\x1e"
-_mcp_sys.stdout.write(_mcp_sentinel + _mcp_json.dumps(_mcp_widget_state_snapshot()) + _mcp_sentinel)
-_mcp_sys.stdout.flush()
+def _mcp_widget_state_snapshot_run():
+    import json as _mcp_json, sys as _mcp_sys
+    def _state():
+        try:
+            from ipywidgets import Widget
+        except Exception:
+            return None
+        try:
+            return Widget.get_manager_state(drop_defaults=True)
+        except Exception as _e:
+            return {"_mcp_error": repr(_e)}
+    _sentinel = "\\x1emcp-widget-state\\x1e"
+    _mcp_sys.stdout.write(_sentinel + _mcp_json.dumps(_state()) + _sentinel)
+    _mcp_sys.stdout.flush()
+try:
+    _mcp_widget_state_snapshot_run()
+finally:
+    globals().pop('_mcp_widget_state_snapshot_run', None)
 """
 
 _SENTINEL = "\x1emcp-widget-state\x1e"

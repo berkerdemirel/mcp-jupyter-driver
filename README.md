@@ -158,7 +158,7 @@ Override via env vars if you need to:
 | `jupyter_server_info()` | Returns the URL + token for the local Jupyter Server. Paste into VS Code's "Existing Jupyter Server" dialog. |
 | `list_kernelspecs()` | Kernelspec names available on the server. |
 | `open_notebook(path, create_if_missing=False, kernel_name="python3")` | Open a notebook + bind a session/kernel. Uses the server's Contents API. |
-| `close_notebook(path, shutdown_kernel=True)` | Close the session. |
+| `close_notebook(path, shutdown_kernel=True)` | Close Claude's binding for this notebook. With `shutdown_kernel=True` we only DELETE sessions Claude created — sessions VS Code (or any other client) owns are left alive, so closing Claude's notebook can never shut down the user's kernel. |
 | `list_open_notebooks()` | All notebooks open in this MCP session. |
 | `refresh_notebook(path)` | Force-refresh handle (every tool already re-reads on entry). |
 
@@ -244,7 +244,9 @@ path encoding).
 
 ```bash
 uv sync
-uv run pytest          # 20 tests (helpers + server-backed integration)
+uv run pytest          # helpers + server-backed integration tests
+uv run pytest tests/test_execution_helpers.py tests/test_session_helpers.py tests/test_widgets.py
+                       # kernel-free unit tests only — fast, no jupyter server required
 uv run python -m mcp_jupyter_driver --self-check
 ```
 
@@ -253,4 +255,6 @@ uv run python -m mcp_jupyter_driver --self-check
 The Jupyter Server we host listens on `127.0.0.1` only and uses a random
 token per launch. Anyone with the token has full Contents-API access to your
 filesystem and can execute arbitrary code through the kernel. Don't share
-the token. Don't run this as root.
+the token. Avoid running this as root outside containers/CI — `jupyter
+server` will refuse without `--allow-root`, which we pass automatically when
+we genuinely are root.

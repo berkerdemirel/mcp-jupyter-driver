@@ -10,7 +10,12 @@ from __future__ import annotations
 
 import pytest
 
-from mcp_jupyter_driver.session import NotebookSession, RebindOutcome
+from mcp_jupyter_driver.errors import CellNotFoundError
+from mcp_jupyter_driver.session import (
+    NotebookSession,
+    RebindOutcome,
+    is_vscode_synthetic_path,
+)
 
 
 class _StubClient:
@@ -279,3 +284,127 @@ async def test_close_deletes_owned_session() -> None:
     session = _make_session(client=client)
     await session.close(shutdown_kernel=True)
     assert client.deleted == ["claude-sess"]
+
+
+# ---------------------------------------------------------------------------
+# patch_cell strict-id behavior
+# ---------------------------------------------------------------------------
+
+
+class _NotebookFakeClient:
+    """A stub that simulates the Contents API in memory."""
+
+    def __init__(self, notebook: dict) -> None:
+        self.notebook = notebook
+        self.last_written: dict | None = None
+
+    async def read_notebook(self, path: str) -> dict:
+        # Hand back a deep-ish copy so test mutation can't leak into our state.
+        import copy
+        return copy.deepcopy(self.notebook)
+
+    async def write_notebook(self, path: str, nb: dict) -> dict:
+        self.notebook = nb
+        self.last_written = nb
+        return {}
+
+
+def _nb(cells: list[dict]) -> dict:
+    return {"cells": cells, "metadata": {}, "nbformat": 4, "nbformat_minor": 5}
+
+
+@pytest.mark.asyncio
+async def test_patch_cell_raises_when_cell_id_disappeared() -> None:
+    """If Claude was working on cell id=abc and the user deleted it, we MUST
+    raise — not silently fall back to fallback_index and clobber a different
+    cell.
+    """
+    client = _NotebookFakeClient(_nb([
+        {"id": "other", "cell_type": "code", "source": "y = 2", "outputs": [], "execution_count": None},
+    ]))
+    session = _make_session(client=client)  # type: ignore[arg-type]
+
+    with pytest.raises(CellNotFoundError):
+        await session.patch_cell(
+            cell_id="abc",            # disappeared
+            fallback_index=0,         # would otherwise hit "other"
+            mutate=lambda c: c.update(outputs=[{"output_type": "stream", "name": "stdout", "text": "X"}]),
+        )
+    # "other" must be untouched.
+    assert client.notebook["cells"][0]["outputs"] == []
+
+
+@pytest.mark.asyncio
+async def test_patch_cell_uses_fallback_index_only_when_no_id() -> None:
+    client = _NotebookFakeClient(_nb([
+        {"cell_type": "code", "source": "y = 2", "outputs": [], "execution_count": None},
+    ]))
+    session = _make_session(client=client)  # type: ignore[arg-type]
+
+    async def _mut(c: dict) -> None:
+        c["source"] = "y = 99"
+
+    await session.patch_cell(
+        cell_id=None,
+        fallback_index=0,
+        mutate=lambda c: c.update(source="y = 99"),
+    )
+    assert client.notebook["cells"][0]["source"] == "y = 99"
+
+
+# ---------------------------------------------------------------------------
+# VS Code synthetic path regex
+# ---------------------------------------------------------------------------
+
+
+def test_vscode_synthetic_path_matches_real_format() -> None:
+    assert is_vscode_synthetic_path(
+        "analysis-jvsc-deadbeef-cafef00d.ipynb", "analysis"
+    )
+
+
+def test_vscode_synthetic_path_rejects_garbage_suffix() -> None:
+    assert not is_vscode_synthetic_path(
+        "analysis-jvsc-anything.ipynb", "analysis"
+    )
+
+
+def test_vscode_synthetic_path_rejects_non_ipynb_extension() -> None:
+    assert not is_vscode_synthetic_path(
+        "analysis-jvsc-deadbeef-cafef00d.txt", "analysis"
+    )
+
+
+def test_vscode_synthetic_path_rejects_wrong_stem() -> None:
+    assert not is_vscode_synthetic_path(
+        "other-jvsc-deadbeef-cafef00d.ipynb", "analysis"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Dead exact-path must not block a live synthetic
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dead_exact_path_does_not_block_live_synthetic() -> None:
+    """If our exact-path session is dead but a live VS Code synthetic exists,
+    auto-rejoin should switch to the synthetic — the previous logic returned
+    False just because *any* exact candidate existed.
+    """
+    client = _StubClient(
+        sessions=[
+            _sess("dead-sess", "dead-kernel", "project/analysis.ipynb"),
+            _sess("vsc-sess", "vsc-kernel", "analysis-jvsc-deadbeef-cafef00d.ipynb"),
+        ],
+        alive={"vsc-kernel"},  # exact-path's kernel is dead
+    )
+    session = _make_session(
+        server_relative="project/analysis.ipynb",
+        session_id="dead-sess",
+        kernel_id="dead-kernel",
+        client=client,
+    )
+    rejoined = await session.maybe_rejoin()
+    assert rejoined is True
+    assert session.kernel_id == "vsc-kernel"

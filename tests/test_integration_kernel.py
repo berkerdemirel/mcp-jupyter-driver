@@ -185,9 +185,10 @@ async def test_rebind_kernel_sticks_across_operations(open_nb) -> None:
 
     # Explicit rebind to B
     async with session.exec_lock:
-        ok = await session.rebind_to_kernel(kB)
-    assert ok
+        outcome = await session.rebind_to_kernel(kB)
+    assert outcome.ok is True
     assert session.kernel_id == kB
+    assert session.pinned is True
 
     # Run something through Claude — auto-rejoin would normally snap us
     # back to the path-matched session A. With the pin set, it must not.
@@ -239,18 +240,20 @@ async def test_close_notebook_does_not_kill_unowned_session(open_nb) -> None:
 
 
 async def test_restart_kernel_clears_pin(open_nb) -> None:
-    """restart_kernel should release the pin so auto-rejoin can move again."""
+    """The restart_kernel MCP tool must release the pin so auto-rejoin can
+    move again. Tests the actual tool path, not a manual emulation.
+    """
+    from mcp_jupyter_driver.server import restart_kernel
     session = await open_nb(["x = 1"])
     await execution.run_cell(session, 0, timeout_s=20)
-    # Pin to our own kernel by rebinding to its own kernel_id.
     outcome = await session.rebind_to_kernel(session.kernel_id)
     assert outcome.ok is True
     assert session.pinned is True
-    # Restart and confirm the pin was cleared.
-    info = await session.client.restart_kernel(session.kernel_id)
-    if isinstance(info, dict) and info.get("id"):
-        session.kernel_id = info["id"]
-    session.unpin()  # what restart_kernel tool does
+
+    # @mcp.tool() registers the function but returns it unchanged, so we
+    # invoke the real tool body. The pin state lives on the registry session.
+    handle = await restart_kernel(session.canonical, clear_outputs=False)
+    assert handle.kernel_id
     assert session.pinned is False
 
 

@@ -198,8 +198,11 @@ async def run_cell(
         # Working copy: list of outputs we'll patch into the on-disk cell.
         # We never PUT the whole notebook from here — only the target cell.
         outputs: list[NotebookNode] = []
+        # Initial clear is strict: if the cell already disappeared (user
+        # deleted it before we even started), fail loudly.
         await _flush_cell(
-            session, cell_id, idx, outputs=[], execution_count=None
+            session, cell_id, idx,
+            outputs=[], execution_count=None, best_effort=False,
         )
 
         try:
@@ -243,13 +246,15 @@ async def run_cell(
                 )
             raise
 
-        # Final flush — outputs and execution_count now in place.
+        # Final flush is strict — if this fails, run_cell must raise rather
+        # than return success while the file on disk is missing outputs.
         await _flush_cell(
             session,
             cell_id,
             idx,
             outputs=outputs,
             execution_count=result.execution_count,
+            best_effort=False,
         )
         return result
 
@@ -261,8 +266,15 @@ async def _flush_cell(
     *,
     outputs: list[NotebookNode],
     execution_count: int | None,
+    best_effort: bool = False,
 ) -> None:
-    """Read fresh, patch only the target cell's outputs+execution_count, write."""
+    """Read fresh, patch only the target cell's outputs+execution_count, write.
+
+    Streaming flushes pass ``best_effort=True`` — transient server hiccups
+    during long output runs shouldn't fail the cell. The initial and final
+    flushes pass ``best_effort=False`` so the caller actually sees missing
+    cells / write failures instead of returning ok=True on a silent miss.
+    """
 
     def _apply(c: dict) -> None:
         if c.get("cell_type") != "code":
@@ -275,10 +287,9 @@ async def _flush_cell(
             cell_id=cell_id, fallback_index=fallback_index, mutate=_apply
         )
     except Exception:
-        # Best-effort during streaming writes. The final flush after the cell
-        # completes will retry; if that also fails, the caller's
-        # write_notebook exception propagates.
-        pass
+        if best_effort:
+            return
+        raise
 
 
 async def _consume(
@@ -349,6 +360,7 @@ async def _consume(
                 await _flush_cell(
                     session, cell_id, fallback_index,
                     outputs=outputs, execution_count=result.execution_count,
+                    best_effort=True,
                 )
                 raise KernelDiedError(session.canonical)
             continue
@@ -433,6 +445,7 @@ async def _consume(
                 await _flush_cell(
                     session, cell_id, fallback_index,
                     outputs=outputs, execution_count=result.execution_count,
+                    best_effort=True,
                 )
             continue
 
@@ -508,6 +521,7 @@ async def _consume(
                 await _flush_cell(
                     session, cell_id, fallback_index,
                     outputs=outputs, execution_count=result.execution_count,
+                    best_effort=True,
                 )
 
             if progress is not None:

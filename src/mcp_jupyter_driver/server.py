@@ -88,6 +88,10 @@ class RunResult(BaseModel):
     truncated: bool = False
     interactive_input: bool = False
     kernel_restarted: bool = False
+    # True if the cell timed out but the kernel is still executing. The next
+    # call will queue behind it — call interrupt_kernel first if you don't
+    # want to wait.
+    kernel_still_running: bool = False
 
 
 class OkResult(BaseModel):
@@ -297,18 +301,17 @@ async def list_jupyter_sessions(path: str | None = None) -> list[JupyterSessionI
     match_reasons: dict[str, str] = {}
     if path is not None:
         from pathlib import Path as _P
-        from .session import server_path
+        from .session import is_vscode_synthetic_path, server_path
 
         target = server_path(path)
         basename = _P(target).name
         stem = _P(basename).stem
-        synthetic_prefix = f"{stem}-jvsc-"
         for s in sessions:
             sess_path = s.get("path") or ""
             name = _P(sess_path).name
             if sess_path == target:
                 match_reasons[s["id"]] = "exact_path"
-            elif name.startswith(synthetic_prefix):
+            elif is_vscode_synthetic_path(name, stem):
                 match_reasons[s["id"]] = "vscode_synthetic"
             elif name == basename:
                 match_reasons[s["id"]] = "basename"
@@ -461,43 +464,55 @@ async def add_cell(
 
 @mcp.tool()
 async def edit_cell(path: str, ref: int | str, source: str) -> CellRef:
-    """Replace a cell's source. Clears outputs and exec_count for code cells."""
+    """Replace a cell's source. Clears outputs and exec_count for code cells.
+
+    Resolves ``ref`` to a stable cell id once and then re-reads the notebook
+    at write time, locating by id. If VS Code reorders cells between our
+    read and write, we still edit the right cell — not whatever happens to
+    be at the original index.
+    """
     session = registry.get_session(path)
     async with session.exec_lock:
         nb = await session.read_notebook()
         idx = resolve_cell_index(nb, ref)
-        cell = nb["cells"][idx]
-        cell["source"] = source
-        if cell.get("cell_type") == "code":
-            cell["outputs"] = []
-            cell["execution_count"] = None
-        await session.write_notebook(nb)
-    return CellRef(index=idx, cell_id=cell.get("id"))
+        original = nb["cells"][idx]
+        cell_id = original.get("id")
+
+        def _apply(c: dict) -> None:
+            c["source"] = source
+            if c.get("cell_type") == "code":
+                c["outputs"] = []
+                c["execution_count"] = None
+
+        await session.patch_cell(
+            cell_id=cell_id,
+            fallback_index=idx if cell_id is None else None,
+            mutate=_apply,
+        )
+    return CellRef(index=idx, cell_id=cell_id)
 
 
 @mcp.tool()
 async def delete_cell(path: str, ref: int | str) -> OkResult:
-    """Remove a cell by index or id."""
+    """Remove a cell by index or id, located by stable id at write time."""
     session = registry.get_session(path)
     async with session.exec_lock:
         nb = await session.read_notebook()
         idx = resolve_cell_index(nb, ref)
-        del nb["cells"][idx]
-        await session.write_notebook(nb)
+        cell_id = nb["cells"][idx].get("id")
+        await session.delete_cell_by_id(cell_id, idx)
     return OkResult()
 
 
 @mcp.tool()
 async def move_cell(path: str, from_ref: int | str, to_index: int) -> OkResult:
-    """Reorder a cell."""
+    """Reorder a cell. Target is identified by stable id at write time."""
     session = registry.get_session(path)
     async with session.exec_lock:
         nb = await session.read_notebook()
         idx = resolve_cell_index(nb, from_ref)
-        cell = nb["cells"].pop(idx)
-        to_idx = max(0, min(to_index, len(nb["cells"])))
-        nb["cells"].insert(to_idx, cell)
-        await session.write_notebook(nb)
+        cell_id = nb["cells"][idx].get("id")
+        await session.move_cell_by_id(cell_id, idx, to_index)
     return OkResult()
 
 
@@ -505,24 +520,41 @@ async def move_cell(path: str, from_ref: int | str, to_index: int) -> OkResult:
 async def clear_cell_outputs(
     path: str, ref: int | str | None = None
 ) -> ClearedResult:
-    """Clear outputs for one cell, or all code cells if ref is None."""
+    """Clear outputs for one cell, or all code cells if ref is None.
+
+    Per-cell clears patch by stable id; clear-all does a single full-notebook
+    PUT (the operation is idempotent on existing outputs, so the race with
+    VS Code only loses outputs we were about to discard anyway).
+    """
     session = registry.get_session(path)
+    if ref is not None:
+        async with session.exec_lock:
+            nb = await session.read_notebook()
+            idx = resolve_cell_index(nb, ref)
+            target = nb["cells"][idx]
+            cell_id = target.get("id")
+            if target.get("cell_type") != "code" or not target.get("outputs"):
+                return ClearedResult(cleared_count=0)
+
+            def _apply(c: dict) -> None:
+                c["outputs"] = []
+                c["execution_count"] = None
+
+            await session.patch_cell(
+                cell_id=cell_id,
+                fallback_index=idx if cell_id is None else None,
+                mutate=_apply,
+            )
+        return ClearedResult(cleared_count=1)
+
     cleared = 0
     async with session.exec_lock:
         nb = await session.read_notebook()
-        if ref is None:
-            for cell in nb.get("cells") or []:
-                if cell.get("cell_type") == "code" and cell.get("outputs"):
-                    cell["outputs"] = []
-                    cell["execution_count"] = None
-                    cleared += 1
-        else:
-            idx = resolve_cell_index(nb, ref)
-            cell = nb["cells"][idx]
+        for cell in nb.get("cells") or []:
             if cell.get("cell_type") == "code" and cell.get("outputs"):
                 cell["outputs"] = []
                 cell["execution_count"] = None
-                cleared = 1
+                cleared += 1
         await session.write_notebook(nb)
     return ClearedResult(cleared_count=cleared)
 
@@ -542,6 +574,7 @@ def _run_result_to_model(result: execution.CellResult) -> RunResult:
         truncated=result.truncated,
         interactive_input=result.interactive_input,
         kernel_restarted=result.kernel_restarted,
+        kernel_still_running=result.kernel_still_running,
     )
 
 
