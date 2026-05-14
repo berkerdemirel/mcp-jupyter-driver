@@ -116,6 +116,53 @@ async def test_inspect_variable_pandas_like(open_nb) -> None:
     assert detail["length"] == 10
 
 
+async def test_auto_rejoin_to_user_kernel_via_vscode_synthetic_path(open_nb) -> None:
+    """VS Code's Jupyter extension creates sessions with a synthetic path:
+    `<stem>-jvsc-<uuid>-<uuid>.ipynb`. Auto-rejoin should still find it.
+    """
+    session = await open_nb(["x = 'claude'"])
+    await execution.run_cell(session, 0, timeout_s=20)
+    kA = session.kernel_id
+
+    body = {
+        "kernel": {"name": "python3"},
+        "name": "vscode-mock",
+        "path": "userwork-jvsc-aaaa1111-bbbb2222.ipynb",
+        "type": "notebook",
+    }
+    r = await session.client._http.post("/api/sessions", json=body)
+    r.raise_for_status()
+    sessB = r.json()
+    kB = sessB["kernel"]["id"]
+    assert kA != kB
+
+    async with session.client.kernel_channel(kB, sessB["id"]) as ch:
+        mid = await ch.send(
+            "execute_request",
+            {
+                "code": "y = 'vscode'",
+                "silent": False, "store_history": True,
+                "user_expressions": {}, "allow_stdin": False, "stop_on_error": True,
+            },
+        )
+        while True:
+            msg = await ch.recv(timeout=10.0)
+            if (msg.get("parent_header") or {}).get("msg_id") != mid:
+                continue
+            if (msg.get("msg_type") == "status"
+                and msg.get("content", {}).get("execution_state") == "idle"):
+                break
+
+    # The matcher uses our notebook's stem. Force it to "userwork" so the
+    # prefix `userwork-jvsc-` matches the simulated VS Code session.
+    session.server_relative = "userwork.ipynb"
+
+    vars_after = await inspection.list_variables(session)
+    names = {v["name"] for v in vars_after}
+    assert session.kernel_id == kB, "Claude should switch to user's kernel"
+    assert "y" in names and "x" not in names
+
+
 async def test_auto_rejoin_to_user_kernel_via_basename(open_nb) -> None:
     """If a session for the same notebook exists under a different path
     encoding (basename match), Claude should auto-rejoin its kernel on the

@@ -121,6 +121,12 @@ class NotebookSession:
 
         sessions = await self.client.list_sessions()
         basename = _P(self.server_relative).name
+        # VS Code's Jupyter extension creates synthetic session paths shaped
+        # like "<stem>-jvsc-<uuid>-<uuid>.ipynb" — same stem, no path, two
+        # UUIDs after a "-jvsc-" tag. We treat that as a match for our
+        # notebook.
+        stem = _P(basename).stem
+        vscode_synthetic_prefix = f"{stem}-jvsc-"
 
         seen: set[str] = set()
         candidates: list[dict] = []
@@ -129,7 +135,12 @@ class NotebookSession:
             if not sid or sid in seen:
                 continue
             spath = s.get("path") or ""
-            if spath == self.server_relative or _P(spath).name == basename:
+            spath_name = _P(spath).name
+            if (
+                spath == self.server_relative
+                or spath_name == basename
+                or spath_name.startswith(vscode_synthetic_prefix)
+            ):
                 seen.add(sid)
                 candidates.append(s)
         if not candidates:
