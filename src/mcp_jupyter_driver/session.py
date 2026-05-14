@@ -12,10 +12,14 @@ import asyncio
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 
 from .client import JupyterClient
-from .errors import CellNotFoundError, NotebookFileMissingError
+from .errors import (
+    CellNotFoundError,
+    NotebookConflictError,
+    NotebookFileMissingError,
+)
 
 
 _UUID_RE = re.compile(
@@ -354,6 +358,67 @@ class NotebookSession:
     async def write_notebook(self, nb: dict) -> None:
         await self.client.write_notebook(self.server_relative, nb)
 
+    async def mutate_notebook_fresh(
+        self,
+        mutator: Callable[[dict], dict | None],
+        *,
+        expected_cell_id: str | None = None,
+        expected_source: str | None = None,
+        operation_name: str = "edit",
+    ) -> dict:
+        """Read the notebook fresh, optionally verify preconditions, apply
+        the mutator, write back through the Contents API.
+
+        This is the single sync-before-mutate primitive. Every MCP tool that
+        changes notebook structure or metadata should go through it so a
+        concurrent VS Code save can't be clobbered by a stale full-notebook
+        PUT.
+
+        Preconditions are checked on the **fresh** read (not on whatever
+        snapshot the caller used earlier), so they catch the read→write race
+        window that ``exec_lock`` alone can't close.
+
+        - ``expected_cell_id``: the notebook must still contain a cell with
+          this id, or ``NotebookConflictError`` is raised. Use it for
+          edit/delete/move/per-cell-clear operations.
+        - ``expected_source``: when combined with ``expected_cell_id``, the
+          target cell's source must equal this string, or
+          ``NotebookConflictError`` is raised. Use it when the caller wants
+          "edit only if the cell still looks the way I saw it" semantics.
+        - ``operation_name``: surfaces in the error message so callers can
+          identify which tool produced the conflict.
+
+        The mutator runs in place on the fresh notebook dict; returning
+        ``None`` keeps that dict, or it may return a new dict to replace it
+        entirely.
+        """
+        nb = await self.read_notebook()
+        if expected_cell_id is not None:
+            cells = nb.get("cells") or []
+            found = None
+            for c in cells:
+                if c.get("id") == expected_cell_id:
+                    found = c
+                    break
+            if found is None:
+                raise NotebookConflictError(
+                    f"{operation_name}: target cell {expected_cell_id!r} no "
+                    f"longer exists on the server — was it deleted by the user?"
+                )
+            if expected_source is not None:
+                src = found.get("source", "")
+                if isinstance(src, list):
+                    src = "".join(src)
+                if src != expected_source:
+                    raise NotebookConflictError(
+                        f"{operation_name}: target cell source changed since "
+                        f"the caller resolved the ref — retry after re-reading."
+                    )
+        mutated = mutator(nb)
+        out = mutated if mutated is not None else nb
+        await self.write_notebook(out)
+        return out
+
     async def patch_cell(
         self,
         *,
@@ -361,80 +426,73 @@ class NotebookSession:
         fallback_index: int | None,
         mutate,
     ) -> None:
-        """Read the latest notebook from the server, locate one cell, apply
-        ``mutate(cell)`` to it, and write back.
+        """Read fresh, locate one cell, apply ``mutate(cell)``, write back.
 
-        Cell location strategy:
-        - If ``cell_id`` is given, look it up by id. If the id has disappeared
-          (e.g. the user deleted the cell from VS Code mid-run), raise
-          ``CellNotFoundError`` — we must NOT silently fall back to
-          ``fallback_index`` and write into a different cell.
-        - If ``cell_id`` is ``None`` (legacy cells without ids), use
-          ``fallback_index`` for the lookup.
+        - If ``cell_id`` is given, look it up by id. If the id has
+          disappeared, raise ``CellNotFoundError`` (a
+          ``NotebookConflictError`` subclass). Never silently fall back to
+          ``fallback_index``.
+        - If ``cell_id`` is ``None`` (legacy cells), use ``fallback_index``.
 
-        Failing loudly here is intentional: silent fallback is exactly how
-        outputs end up patched into the wrong cell after a concurrent reorder.
+        Output-flushing during ``run_cell`` is the hot path here; structural
+        edits should prefer ``mutate_notebook_fresh`` directly.
         """
-        nb = await self.read_notebook()
-        cells = nb.get("cells") or []
-        idx: int | None = None
-        if cell_id is not None:
-            for i, c in enumerate(cells):
-                if c.get("id") == cell_id:
-                    idx = i
-                    break
-            if idx is None:
+
+        def _do(nb: dict) -> None:
+            cells = nb.get("cells") or []
+            if cell_id is not None:
+                for c in cells:
+                    if c.get("id") == cell_id:
+                        mutate(c)
+                        return None
                 raise CellNotFoundError(cell_id)
-        else:
             if fallback_index is None or not (0 <= fallback_index < len(cells)):
                 raise CellNotFoundError(fallback_index)
-            idx = fallback_index
-        mutate(cells[idx])
-        await self.write_notebook(nb)
+            mutate(cells[fallback_index])
+            return None
+
+        await self.mutate_notebook_fresh(_do, operation_name="patch_cell")
 
     async def delete_cell_by_id(self, cell_id: str | None, fallback_index: int) -> None:
-        """Read fresh, drop the target cell, write back.
+        """Read fresh, drop the target cell by id, write back."""
 
-        Locates by ``cell_id`` (raises ``CellNotFoundError`` if it's gone) so
-        a concurrent VS Code reorder doesn't make us delete a different cell.
-        Falls back to ``fallback_index`` only when no id was available.
-        """
-        nb = await self.read_notebook()
-        cells = nb.get("cells") or []
-        idx: int | None = None
-        if cell_id is not None:
-            for i, c in enumerate(cells):
-                if c.get("id") == cell_id:
-                    idx = i
-                    break
-            if idx is None:
+        def _do(nb: dict) -> None:
+            cells = nb.get("cells") or []
+            if cell_id is not None:
+                for i, c in enumerate(cells):
+                    if c.get("id") == cell_id:
+                        del cells[i]
+                        return None
                 raise CellNotFoundError(cell_id)
-        else:
             if not (0 <= fallback_index < len(cells)):
                 raise CellNotFoundError(fallback_index)
-            idx = fallback_index
-        del cells[idx]
-        await self.write_notebook(nb)
+            del cells[fallback_index]
+            return None
+
+        await self.mutate_notebook_fresh(_do, operation_name="delete_cell")
 
     async def move_cell_by_id(
         self, cell_id: str | None, fallback_index: int, to_index: int
     ) -> None:
-        """Read fresh, pop the target cell, insert at ``to_index``, write back."""
-        nb = await self.read_notebook()
-        cells = nb.get("cells") or []
-        idx: int | None = None
-        if cell_id is not None:
-            for i, c in enumerate(cells):
-                if c.get("id") == cell_id:
-                    idx = i
-                    break
-            if idx is None:
-                raise CellNotFoundError(cell_id)
-        else:
-            if not (0 <= fallback_index < len(cells)):
-                raise CellNotFoundError(fallback_index)
-            idx = fallback_index
-        cell = cells.pop(idx)
-        to_idx = max(0, min(to_index, len(cells)))
-        cells.insert(to_idx, cell)
-        await self.write_notebook(nb)
+        """Read fresh, pop the target cell by id, insert at ``to_index``."""
+
+        def _do(nb: dict) -> None:
+            cells = nb.get("cells") or []
+            idx: int | None = None
+            if cell_id is not None:
+                for i, c in enumerate(cells):
+                    if c.get("id") == cell_id:
+                        idx = i
+                        break
+                if idx is None:
+                    raise CellNotFoundError(cell_id)
+            else:
+                if not (0 <= fallback_index < len(cells)):
+                    raise CellNotFoundError(fallback_index)
+                idx = fallback_index
+            cell = cells.pop(idx)
+            to_idx = max(0, min(to_index, len(cells)))
+            cells.insert(to_idx, cell)
+            return None
+
+        await self.mutate_notebook_fresh(_do, operation_name="move_cell")

@@ -584,6 +584,10 @@ async def _snapshot_widgets(session: NotebookSession, ch) -> None:
     snapshot = widgets.parse_snapshot_stdout("".join(collected))
     if snapshot is None:
         return
-    fresh = await session.read_notebook()
-    widgets.install_widget_state(fresh.setdefault("metadata", {}), snapshot)
-    await session.write_notebook(fresh)
+
+    def _install(nb: dict) -> None:
+        widgets.install_widget_state(nb.setdefault("metadata", {}), snapshot)
+
+    await session.mutate_notebook_fresh(
+        _install, operation_name="widget_state_snapshot"
+    )

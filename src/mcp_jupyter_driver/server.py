@@ -16,6 +16,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from pydantic import BaseModel, Field
 
 from . import execution, inspection, registry
+from .errors import CellNotFoundError, NotebookConflictError
 from .jserver import get_or_start_server, stop_server
 from .session import NotebookSession, resolve_cell_index
 
@@ -441,10 +442,16 @@ async def add_cell(
     source: str,
     index: int | None = None,
 ) -> CellRef:
-    """Insert a new cell. `index=None` appends to the end."""
+    """Insert a new cell. ``index=None`` appends to the end.
+
+    The insertion happens on the freshest server-side notebook state — if
+    the user added cells in VS Code since the last MCP read, those cells
+    are preserved and the new cell lands relative to that fresher state.
+    """
     session = registry.get_session(path)
-    async with session.exec_lock:
-        nb = await session.read_notebook()
+    placed: dict = {}
+
+    def _insert(nb: dict) -> None:
         if cell_type == "code":
             cell = nbformat.v4.new_code_cell(source=source)
         elif cell_type == "markdown":
@@ -454,47 +461,68 @@ async def add_cell(
         cells = nb.setdefault("cells", [])
         if index is None or index >= len(cells):
             cells.append(cell)
-            idx = len(cells) - 1
+            placed["idx"] = len(cells) - 1
         else:
-            idx = max(0, index)
-            cells.insert(idx, cell)
-        await session.write_notebook(nb)
-    return CellRef(index=idx, cell_id=cell.get("id"))
+            i = max(0, index)
+            cells.insert(i, cell)
+            placed["idx"] = i
+        placed["cell"] = cell
+
+    async with session.exec_lock:
+        await session.mutate_notebook_fresh(_insert, operation_name="add_cell")
+    return CellRef(index=placed["idx"], cell_id=placed["cell"].get("id"))
 
 
 @mcp.tool()
 async def edit_cell(path: str, ref: int | str, source: str) -> CellRef:
     """Replace a cell's source. Clears outputs and exec_count for code cells.
 
-    Resolves ``ref`` to a stable cell id once and then re-reads the notebook
-    at write time, locating by id. If VS Code reorders cells between our
-    read and write, we still edit the right cell — not whatever happens to
-    be at the original index.
+    Resolves ``ref`` to a stable cell id from a fresh read, then re-reads
+    immediately before writing and locates by id (raising
+    ``NotebookConflictError`` if the cell has disappeared). A concurrent VS
+    Code reorder can't make us edit the wrong cell, and a concurrent
+    deletion produces a clear conflict instead of writing.
     """
     session = registry.get_session(path)
     async with session.exec_lock:
         nb = await session.read_notebook()
         idx = resolve_cell_index(nb, ref)
-        original = nb["cells"][idx]
-        cell_id = original.get("id")
+        cell_id = nb["cells"][idx].get("id")
 
-        def _apply(c: dict) -> None:
-            c["source"] = source
-            if c.get("cell_type") == "code":
-                c["outputs"] = []
-                c["execution_count"] = None
+        def _do(fresh_nb: dict) -> None:
+            cells = fresh_nb.get("cells") or []
+            target = None
+            if cell_id is not None:
+                for c in cells:
+                    if c.get("id") == cell_id:
+                        target = c
+                        break
+            else:
+                if 0 <= idx < len(cells):
+                    target = cells[idx]
+            if target is None:
+                raise CellNotFoundError(cell_id if cell_id is not None else idx)
+            target["source"] = source
+            if target.get("cell_type") == "code":
+                target["outputs"] = []
+                target["execution_count"] = None
 
-        await session.patch_cell(
-            cell_id=cell_id,
-            fallback_index=idx if cell_id is None else None,
-            mutate=_apply,
+        await session.mutate_notebook_fresh(
+            _do,
+            expected_cell_id=cell_id,
+            operation_name="edit_cell",
         )
     return CellRef(index=idx, cell_id=cell_id)
 
 
 @mcp.tool()
 async def delete_cell(path: str, ref: int | str) -> OkResult:
-    """Remove a cell by index or id, located by stable id at write time."""
+    """Remove a cell by index or id, located by stable id at write time.
+
+    Raises ``NotebookConflictError`` (catchable as such by the caller, or
+    as ``CellNotFoundError`` for the specific "cell is gone" subclass) if
+    the cell has disappeared between the ref resolution and the write.
+    """
     session = registry.get_session(path)
     async with session.exec_lock:
         nb = await session.read_notebook()
@@ -522,9 +550,10 @@ async def clear_cell_outputs(
 ) -> ClearedResult:
     """Clear outputs for one cell, or all code cells if ref is None.
 
-    Per-cell clears patch by stable id; clear-all does a single full-notebook
-    PUT (the operation is idempotent on existing outputs, so the race with
-    VS Code only loses outputs we were about to discard anyway).
+    Per-cell clears patch by stable cell id; clear-all also re-reads
+    immediately before writing so concurrent VS Code source edits aren't
+    reverted — we only ever zero the ``outputs`` and ``execution_count``
+    fields on the freshest server-side cell objects.
     """
     session = registry.get_session(path)
     if ref is not None:
@@ -547,16 +576,20 @@ async def clear_cell_outputs(
             )
         return ClearedResult(cleared_count=1)
 
-    cleared = 0
-    async with session.exec_lock:
-        nb = await session.read_notebook()
+    counter: dict[str, int] = {"n": 0}
+
+    def _clear_all(nb: dict) -> None:
         for cell in nb.get("cells") or []:
             if cell.get("cell_type") == "code" and cell.get("outputs"):
                 cell["outputs"] = []
                 cell["execution_count"] = None
-                cleared += 1
-        await session.write_notebook(nb)
-    return ClearedResult(cleared_count=cleared)
+                counter["n"] += 1
+
+    async with session.exec_lock:
+        await session.mutate_notebook_fresh(
+            _clear_all, operation_name="clear_cell_outputs(all)"
+        )
+    return ClearedResult(cleared_count=counter["n"])
 
 
 # ----- execution -------------------------------------------------------------
@@ -617,15 +650,28 @@ async def run_code(
     persist_as_cell: bool = False,
     timeout_s: float = 120.0,
 ) -> RunCodeResult:
-    """Append a code cell, run it, optionally remove it after."""
+    """Append a code cell, run it, optionally remove it after.
+
+    Cleanup of the temporary cell runs in a ``finally`` so it happens even
+    if the run raises. The cleanup is skipped (the cell is kept visible) if
+    the run timed out with ``kernel_still_running=True`` — deleting the
+    cell while the kernel is still writing outputs to it would lose the
+    follow-up output. ``RunCodeResult.persisted`` reflects whether the
+    cell ended up persisted on disk so the caller can tell.
+    """
     session = registry.get_session(path)
-    async with session.exec_lock:
-        nb = await session.read_notebook()
+    placed: dict = {}
+
+    def _append(nb: dict) -> None:
         cell = nbformat.v4.new_code_cell(source=source)
-        nb["cells"].append(cell)
-        idx = len(nb["cells"]) - 1
-        cell_id = cell.get("id")
-        await session.write_notebook(nb)
+        nb.setdefault("cells", []).append(cell)
+        placed["cell"] = cell
+        placed["idx"] = len(nb["cells"]) - 1
+
+    async with session.exec_lock:
+        await session.mutate_notebook_fresh(_append, operation_name="run_code_append")
+    cell_id = placed["cell"].get("id")
+    idx = placed["idx"]
 
     async def _progress(progress: float, total: float | None, message: str) -> None:
         try:
@@ -633,25 +679,37 @@ async def run_code(
         except Exception:
             pass
 
-    result = await execution.run_cell(
-        session, cell_id or idx, timeout_s=timeout_s, progress=_progress
+    result: execution.CellResult | None = None
+    try:
+        result = await execution.run_cell(
+            session, cell_id or idx, timeout_s=timeout_s, progress=_progress
+        )
+    finally:
+        # Only delete the temp cell if we got a clean result and the kernel
+        # isn't still running against it.
+        safe_to_delete = (
+            not persist_as_cell
+            and result is not None
+            and not result.kernel_still_running
+        )
+        if safe_to_delete:
+            async with session.exec_lock:
+                try:
+                    await session.delete_cell_by_id(cell_id, idx)
+                except NotebookConflictError:
+                    # User already removed the cell; nothing to clean up.
+                    pass
+
+    final_persisted = persist_as_cell or (
+        result is not None and result.kernel_still_running
     )
-
-    if not persist_as_cell:
-        async with session.exec_lock:
-            nb = await session.read_notebook()
-            try:
-                ridx = resolve_cell_index(nb, cell_id or idx)
-                del nb["cells"][ridx]
-                await session.write_notebook(nb)
-            except Exception:
-                pass
-
     return RunCodeResult(
         cell_index=idx,
         cell_id=cell_id,
-        persisted=persist_as_cell,
-        run=_run_result_to_model(result),
+        persisted=final_persisted,
+        run=_run_result_to_model(result) if result is not None else _run_result_to_model(
+            execution.CellResult(status="error", execution_count=None)
+        ),
     )
 
 
@@ -741,10 +799,13 @@ async def restart_kernel(path: str, clear_outputs: bool = False) -> NotebookHand
                 session.kernel_name = kname
         session.unpin()
         if clear_outputs:
-            nb = await session.read_notebook()
-            for cell in nb.get("cells") or []:
-                if cell.get("cell_type") == "code":
-                    cell["outputs"] = []
-                    cell["execution_count"] = None
-            await session.write_notebook(nb)
+            def _clear(nb: dict) -> None:
+                for cell in nb.get("cells") or []:
+                    if cell.get("cell_type") == "code":
+                        cell["outputs"] = []
+                        cell["execution_count"] = None
+
+            await session.mutate_notebook_fresh(
+                _clear, operation_name="restart_kernel(clear_outputs)"
+            )
     return await _to_handle(session)

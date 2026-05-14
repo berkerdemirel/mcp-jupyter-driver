@@ -229,6 +229,27 @@ path encoding).
    - Delete a cell in VS Code. Variables it created stay alive. Claude can
      still use them.
 
+## Conflict protection for concurrent edits
+
+Before every structural notebook mutation (`add_cell`, `edit_cell`,
+`delete_cell`, `move_cell`, `clear_cell_outputs`, `run_code`'s temp-cell
+path, `restart_kernel(clear_outputs=True)`, and the widget metadata
+install), the MCP re-reads the notebook from the Jupyter Server and applies
+the edit on the freshest server-side state. Targets are located by stable
+`cell.id`, not by index — so a concurrent VS Code reorder can't make Claude
+edit the wrong cell, and a concurrent delete produces a clear
+`NotebookConflictError` instead of writing.
+
+In practice this means:
+
+- If you edit cell A in VS Code while Claude edits cell B, both edits land.
+- If you delete a cell that Claude is about to edit, Claude's call fails
+  with a `NotebookConflictError` ("target cell no longer exists") instead
+  of accidentally editing whatever cell ended up at that index.
+- `clear_cell_outputs` (all-cells mode) and `restart_kernel(clear_outputs=True)`
+  only zero `outputs` / `execution_count` on the freshest cells, so source
+  edits you made in VS Code are preserved.
+
 ## Failure-mode behavior
 
 - **Per-output cap 1 MB, per-cell total 5 MB** — text/JSON outputs over the cap

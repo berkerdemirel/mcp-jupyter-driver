@@ -30,8 +30,23 @@ class NotebookFileMissingError(DriverError):
         self.path = path
 
 
-class CellNotFoundError(DriverError):
-    def __init__(self, ref: int | str) -> None:
+class NotebookConflictError(DriverError):
+    """Raised when a notebook mutation can't be applied to the server's
+    current state without potentially clobbering a concurrent edit.
+
+    The MCP layer must re-read the notebook from Jupyter Server immediately
+    before every structural write; if the target cell has disappeared, has
+    been replaced, or no longer matches the source the caller expected, we
+    raise this instead of writing. Catch ``NotebookConflictError`` to handle
+    every conflict variant (including ``CellNotFoundError``).
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+
+class CellNotFoundError(NotebookConflictError):
+    def __init__(self, ref: int | str | None) -> None:
         super().__init__(f"No cell matching {ref!r}.")
         self.ref = ref
 

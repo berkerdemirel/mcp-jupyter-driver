@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from mcp_jupyter_driver.errors import CellNotFoundError
+from mcp_jupyter_driver.errors import CellNotFoundError, NotebookConflictError
 from mcp_jupyter_driver.session import (
     NotebookSession,
     RebindOutcome,
@@ -384,6 +384,125 @@ def test_vscode_synthetic_path_rejects_wrong_stem() -> None:
 # ---------------------------------------------------------------------------
 # Dead exact-path must not block a live synthetic
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# mutate_notebook_fresh: the sync-before-mutate primitive
+# ---------------------------------------------------------------------------
+
+
+def _full_session_with_nb(nb: dict) -> tuple[NotebookSession, _NotebookFakeClient]:
+    client = _NotebookFakeClient(nb)
+    session = _make_session(client=client)  # type: ignore[arg-type]
+    return session, client
+
+
+@pytest.mark.asyncio
+async def test_mutate_notebook_fresh_basic_write() -> None:
+    session, client = _full_session_with_nb(_nb([
+        {"id": "a", "cell_type": "code", "source": "x = 1", "outputs": [], "execution_count": None},
+    ]))
+
+    def _mut(nb: dict) -> None:
+        nb["cells"][0]["source"] = "x = 99"
+
+    out = await session.mutate_notebook_fresh(_mut, operation_name="test")
+    assert out["cells"][0]["source"] == "x = 99"
+    assert client.notebook["cells"][0]["source"] == "x = 99"
+
+
+@pytest.mark.asyncio
+async def test_mutate_notebook_fresh_missing_expected_cell_raises_conflict() -> None:
+    """The target cell vanished between caller plan and our fresh read."""
+    session, client = _full_session_with_nb(_nb([
+        {"id": "other", "cell_type": "code", "source": "y = 2", "outputs": [], "execution_count": None},
+    ]))
+
+    with pytest.raises(NotebookConflictError):
+        await session.mutate_notebook_fresh(
+            lambda nb: None,
+            expected_cell_id="vanished",
+            operation_name="edit_cell",
+        )
+    # And not a write either.
+    assert client.last_written is None
+
+
+@pytest.mark.asyncio
+async def test_mutate_notebook_fresh_expected_source_mismatch_raises_conflict() -> None:
+    """Cell still exists, but its source changed since the caller resolved it."""
+    session, client = _full_session_with_nb(_nb([
+        {"id": "a", "cell_type": "code", "source": "x = 2", "outputs": [], "execution_count": None},
+    ]))
+
+    with pytest.raises(NotebookConflictError):
+        await session.mutate_notebook_fresh(
+            lambda nb: None,
+            expected_cell_id="a",
+            expected_source="x = 1",  # caller saw "x = 1" but it's now "x = 2"
+            operation_name="edit_cell",
+        )
+    assert client.last_written is None
+
+
+@pytest.mark.asyncio
+async def test_mutate_notebook_fresh_preserves_concurrent_user_cell() -> None:
+    """Between the caller planning the edit and the mutator running, the
+    user added a brand-new cell in VS Code. The fresh read picks it up; the
+    mutator only touches the target cell, and the user's cell survives.
+    """
+    session, client = _full_session_with_nb(_nb([
+        {"id": "a", "cell_type": "code", "source": "x = 1", "outputs": [], "execution_count": None},
+    ]))
+
+    # Simulate "user added a cell from VS Code" by mutating the stub state
+    # before we call. (The helper reads fresh, so it sees this state.)
+    client.notebook["cells"].append(
+        {"id": "user-new", "cell_type": "code", "source": "u = 99", "outputs": [], "execution_count": None}
+    )
+
+    def _edit_a(nb: dict) -> None:
+        for c in nb["cells"]:
+            if c.get("id") == "a":
+                c["source"] = "x = 42"
+
+    await session.mutate_notebook_fresh(
+        _edit_a, expected_cell_id="a", operation_name="edit_cell",
+    )
+    ids = [c["id"] for c in client.notebook["cells"]]
+    assert ids == ["a", "user-new"], "user-added cell must be preserved"
+    sources = {c["id"]: c["source"] for c in client.notebook["cells"]}
+    assert sources == {"a": "x = 42", "user-new": "u = 99"}
+
+
+@pytest.mark.asyncio
+async def test_clear_all_outputs_pattern_does_not_revert_source_edits() -> None:
+    """The clear-all mutator only zeroes outputs/execution_count. Source
+    edits the user made in VS Code between our read and the mutator running
+    are read freshly and preserved.
+    """
+    session, client = _full_session_with_nb(_nb([
+        {"id": "a", "cell_type": "code", "source": "x = 1",
+         "outputs": [{"output_type": "stream", "name": "stdout", "text": "old"}],
+         "execution_count": 1},
+    ]))
+
+    # User edits the source from VS Code right before our clear runs.
+    client.notebook["cells"][0]["source"] = "x = 2  # user edit"
+
+    def _clear_all(nb: dict) -> None:
+        for c in nb.get("cells") or []:
+            if c.get("cell_type") == "code" and c.get("outputs"):
+                c["outputs"] = []
+                c["execution_count"] = None
+
+    await session.mutate_notebook_fresh(
+        _clear_all, operation_name="clear_cell_outputs(all)"
+    )
+    cell = client.notebook["cells"][0]
+    assert cell["source"] == "x = 2  # user edit"
+    assert cell["outputs"] == []
+    assert cell["execution_count"] is None
 
 
 @pytest.mark.asyncio
