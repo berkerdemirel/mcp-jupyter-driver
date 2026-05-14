@@ -6,6 +6,22 @@ runs are visible to you. Variables persist in the kernel even if the cell
 that defined them is deleted, because the kernel is shared and decoupled
 from the notebook file.
 
+## Live notebook view sync (real-time collaboration)
+
+Cell *outputs* and *structural edits* that Claude writes through the Contents
+API are propagated to your editor in real time via
+[`jupyter-collaboration`](https://github.com/jupyterlab/jupyter-collaboration)
+(Y.js / CRDT). VS Code's Jupyter extension and JupyterLab both support this
+on the client side — they connect to the server's Y.js WebSocket and
+re-render automatically when any other client writes to the notebook.
+
+So when Claude runs a cell, you see the new outputs in the VS Code notebook
+view without doing anything. Same for cells Claude adds, edits, deletes,
+or moves.
+
+(Variable sharing through the kernel works regardless — that's the more
+fundamental property of the shared-server architecture, below.)
+
 ## How it works
 
 The MCP supervises a `jupyter server` subprocess on localhost. Both Claude
