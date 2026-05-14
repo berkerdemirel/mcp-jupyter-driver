@@ -8,12 +8,15 @@ authors = [
 ]
 requires-python = ">=3.10"
 dependencies = [
+    "httpx>=0.28.1",
     "ipykernel>=7.2.0",
     "ipywidgets>=8.1.8",
     "jupyter-client>=8",
+    "jupyter-server>=2.18.2",
     "mcp[cli]>=1.27.1",
     "nbformat>=5",
     "pydantic>=2",
+    "websockets>=16.0",
 ]
 
 [project.scripts]

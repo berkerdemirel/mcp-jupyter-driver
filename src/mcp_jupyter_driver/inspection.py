@@ -1,15 +1,4 @@
-"""Variable inspection and completion against the live kernel.
-
-Variables are listed/inspected by running a small `_mcp_`-prefixed helper in
-the kernel that JSON-dumps its result to stdout between sentinels. `silent`
-on execute_request unfortunately suppresses iopub streams entirely (so we
-couldn't capture the stdout), so we use `silent=False, store_history=False`
-instead — the helper still runs invisibly to the user because we don't
-attach its output to any cell.
-
-The helper names are all `_mcp_`-prefixed and are filtered out of variable
-listings.
-"""
+"""Variable inspection / completion via the kernel WebSocket."""
 
 from __future__ import annotations
 
@@ -20,17 +9,14 @@ from typing import Any
 from .errors import KernelDiedError
 from .session import NotebookSession
 
-IOPUB_TIMEOUT_S = 0.5
-HELPER_TIMEOUT_S = 5.0
+WS_TIMEOUT_S = 0.5
+HELPER_TIMEOUT_S = 8.0
 
 _SENTINEL_TAG = "mcp-helper"
 _SENTINEL = f"\x1e{_SENTINEL_TAG}\x1e"
 
 
 def _wrap(payload_expr: str) -> str:
-    """Wrap a Python expression producing a JSON-serializable value into
-    stdout-bracketed JSON the parser can recover.
-    """
     return (
         "import json as _mcp_json, sys as _mcp_sys\n"
         f"_mcp_payload = {payload_expr}\n"
@@ -59,7 +45,6 @@ def _mcp_list_vars(_include_private=False):
             _mcp_tname = type(_mcp_v).__name__
         except Exception:
             _mcp_tname = '?'
-        # size hint
         _mcp_size = ''
         try:
             if hasattr(_mcp_v, 'shape'):
@@ -70,7 +55,6 @@ def _mcp_list_vars(_include_private=False):
                 _mcp_size = 'len=' + str(len(_mcp_v))
         except Exception:
             pass
-        # repr preview
         try:
             _mcp_r = repr(_mcp_v)
         except Exception as _mcp_e:
@@ -119,7 +103,6 @@ def _mcp_inspect(_name, _max_repr):
         except Exception: pass
         try:
             _head = _v.head(5).to_dict(orient='list')
-            # make sure values are JSON-friendly
             _head = {{str(k): [None if (isinstance(x, float) and (x != x)) else x for x in vs] for k, vs in _head.items()}}
             _info['head'] = _head
         except Exception: pass
@@ -135,31 +118,51 @@ def _mcp_inspect(_name, _max_repr):
 async def _execute_capture(
     session: NotebookSession, code: str, *, timeout_s: float = HELPER_TIMEOUT_S
 ) -> Any:
-    """Run silent-ish helper code and parse its sentinel-wrapped JSON stdout."""
-    kc = session.kc
-    msg_id = kc.execute(
-        code, silent=False, store_history=False, allow_stdin=False
-    )
-    collected: list[str] = []
-    loop = asyncio.get_event_loop()
-    deadline = loop.time() + timeout_s
-    while True:
-        if loop.time() > deadline:
-            return None
-        try:
-            msg = await asyncio.wait_for(kc.get_iopub_msg(), timeout=IOPUB_TIMEOUT_S)
-        except asyncio.TimeoutError:
-            if not await session.km.is_alive():
-                raise KernelDiedError(str(session.path))
-            continue
-        if (msg.get("parent_header") or {}).get("msg_id") != msg_id:
-            continue
-        mtype = msg.get("msg_type")
-        content = msg.get("content", {})
-        if mtype == "stream" and content.get("name") == "stdout":
-            collected.append(content.get("text", ""))
-        elif mtype == "status" and content.get("execution_state") == "idle":
-            break
+    """Run helper code on the shared kernel and parse sentinel-wrapped JSON."""
+    async with session.client.kernel_channel(
+        session.kernel_id, session.session_id
+    ) as ch:
+        msg_id = await ch.send(
+            "execute_request",
+            {
+                "code": code,
+                "silent": False,
+                "store_history": False,
+                "user_expressions": {},
+                "allow_stdin": False,
+                "stop_on_error": True,
+            },
+        )
+        collected: list[str] = []
+        deadline = asyncio.get_event_loop().time() + timeout_s
+        saw_idle = False
+        shell_reply_seen = False
+        while not (saw_idle and shell_reply_seen):
+            if asyncio.get_event_loop().time() > deadline:
+                return None
+            try:
+                msg = await ch.recv(timeout=WS_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                try:
+                    await session.client.get_kernel(session.kernel_id)
+                except Exception:
+                    raise KernelDiedError(session.canonical)
+                continue
+            if (msg.get("parent_header") or {}).get("msg_id") != msg_id:
+                continue
+            channel = msg.get("channel")
+            mt = msg.get("msg_type")
+            content = msg.get("content", {})
+            if channel == "shell" and mt == "execute_reply":
+                shell_reply_seen = True
+                continue
+            if mt == "stream" and content.get("name") == "stdout":
+                text = content.get("text", "")
+                if isinstance(text, list):
+                    text = "".join(text)
+                collected.append(text)
+            elif mt == "status" and content.get("execution_state") == "idle":
+                saw_idle = True
 
     text = "".join(collected)
     parts = text.split(_SENTINEL)
@@ -171,8 +174,11 @@ async def _execute_capture(
         return None
 
 
-async def list_variables(session: NotebookSession, *, include_private: bool = False) -> list[dict]:
+async def list_variables(
+    session: NotebookSession, *, include_private: bool = False
+) -> list[dict]:
     async with session.exec_lock:
+        await session.maybe_rejoin()
         result = await _execute_capture(session, _list_vars_code(include_private))
     return result if isinstance(result, list) else []
 
@@ -181,6 +187,7 @@ async def inspect_variable(
     session: NotebookSession, name: str, *, max_repr_len: int = 2000
 ) -> dict:
     async with session.exec_lock:
+        await session.maybe_rejoin()
         result = await _execute_capture(
             session, _inspect_var_code(name, max_repr_len)
         )
@@ -192,26 +199,30 @@ async def inspect_variable(
 async def complete(
     session: NotebookSession, code: str, cursor_pos: int
 ) -> dict:
-    """Wrap kernel `complete_request`. Returns {matches, cursor_start, cursor_end}."""
     async with session.exec_lock:
-        kc = session.kc
-        msg_id = kc.complete(code, cursor_pos)
-        # drain shell channel until our reply
-        deadline = asyncio.get_event_loop().time() + 5.0
-        while True:
-            if asyncio.get_event_loop().time() > deadline:
-                return {"matches": [], "cursor_start": cursor_pos, "cursor_end": cursor_pos}
-            try:
-                msg = await asyncio.wait_for(kc.get_shell_msg(), timeout=0.5)
-            except asyncio.TimeoutError:
-                if not await session.km.is_alive():
-                    raise KernelDiedError(str(session.path))
-                continue
-            if (msg.get("parent_header") or {}).get("msg_id") != msg_id:
-                continue
-            content = msg.get("content", {})
-            return {
-                "matches": list(content.get("matches") or []),
-                "cursor_start": int(content.get("cursor_start", cursor_pos)),
-                "cursor_end": int(content.get("cursor_end", cursor_pos)),
-            }
+        await session.maybe_rejoin()
+        async with session.client.kernel_channel(
+            session.kernel_id, session.session_id
+        ) as ch:
+            msg_id = await ch.send(
+                "complete_request",
+                {"code": code, "cursor_pos": cursor_pos},
+                channel="shell",
+            )
+            deadline = asyncio.get_event_loop().time() + 5.0
+            while asyncio.get_event_loop().time() < deadline:
+                try:
+                    msg = await ch.recv(timeout=WS_TIMEOUT_S)
+                except asyncio.TimeoutError:
+                    continue
+                if (msg.get("parent_header") or {}).get("msg_id") != msg_id:
+                    continue
+                if msg.get("channel") != "shell":
+                    continue
+                content = msg.get("content", {})
+                return {
+                    "matches": list(content.get("matches") or []),
+                    "cursor_start": int(content.get("cursor_start", cursor_pos)),
+                    "cursor_end": int(content.get("cursor_end", cursor_pos)),
+                }
+    return {"matches": [], "cursor_start": cursor_pos, "cursor_end": cursor_pos}

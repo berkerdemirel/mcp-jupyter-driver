@@ -1,155 +1,186 @@
-"""Per-notebook session: kernel + in-memory notebook + locks + debounced writer.
+"""Per-notebook session: server-managed kernel + serialization lock.
 
-One session per .ipynb path, lifetime managed by the registry. The session
-keeps a single async kernel manager + client; we serialize all execution and
-structural edits through `exec_lock` to match Jupyter's own single-runner
-model. Cross-session work is fully parallel.
+The Jupyter Server owns the kernel and the .ipynb file. We track the session
+binding (notebook path <-> jupyter session id <-> kernel id) so we can
+reuse it across tool calls and serialize Claude-driven operations per
+notebook.
 """
 
 from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Any
 
-import nbformat
-from jupyter_client.manager import AsyncKernelManager
-from nbformat.notebooknode import NotebookNode
+from .client import JupyterClient
+from .errors import CellNotFoundError, NotebookFileMissingError
 
-from .errors import CellNotFoundError, KernelDiedError
-from .notebook_io import DebouncedWriter, new_notebook, read_notebook
+
+def server_path(path: str) -> str:
+    """Strip the leading slash so it's a valid Contents API path under root_dir=/."""
+    return Path(path).expanduser().resolve(strict=False).as_posix().lstrip("/")
+
+
+def canonical_key(path: str) -> str:
+    """Stable registry key for a notebook path."""
+    return Path(path).expanduser().resolve(strict=False).as_posix()
+
+
+def resolve_cell_index(nb: dict, ref: int | str) -> int:
+    cells = nb.get("cells") or []
+    if isinstance(ref, int):
+        if 0 <= ref < len(cells):
+            return ref
+        raise CellNotFoundError(ref)
+    for i, c in enumerate(cells):
+        if c.get("id") == ref:
+            return i
+    raise CellNotFoundError(ref)
 
 
 class NotebookSession:
-    def __init__(self, path: Path, nb: NotebookNode) -> None:
-        self.path = path
-        self.nb = nb
-        self.km: AsyncKernelManager = AsyncKernelManager(kernel_name="python3")
-        self.kc: Any = None  # AsyncKernelClient, typed loose to avoid import churn
+    def __init__(
+        self,
+        *,
+        canonical: str,
+        server_relative: str,
+        session_id: str,
+        kernel_id: str,
+        kernel_name: str,
+        client: JupyterClient,
+    ) -> None:
+        self.canonical = canonical
+        self.server_relative = server_relative
+        self.session_id = session_id
+        self.kernel_id = kernel_id
+        self.kernel_name = kernel_name
+        self.client = client
         self.exec_lock = asyncio.Lock()
-        self.writer = DebouncedWriter(self.path, lambda: self.nb)
-        # Track widget comm activity for diagnostics. The authoritative state
-        # snapshot is fetched via a silent kernel call in execution.py, but
-        # we keep a cheap presence map here.
-        self.widget_comms: dict[str, dict[str, Any]] = {}
-        self.execution_count: int = 0
 
     @classmethod
-    async def open(cls, path: Path, *, create_if_missing: bool = False) -> "NotebookSession":
-        if path.exists():
-            nb = read_notebook(path)
-        elif create_if_missing:
-            nb = new_notebook()
-        else:
-            from .errors import NotebookFileMissingError
+    async def open(
+        cls,
+        path: str,
+        *,
+        client: JupyterClient,
+        create_if_missing: bool = False,
+        kernel_name: str = "python3",
+    ) -> "NotebookSession":
+        canonical = canonical_key(path)
+        rel = server_path(path)
+        if not await client.notebook_exists(rel):
+            if not create_if_missing:
+                raise NotebookFileMissingError(canonical)
+            await client.create_notebook_if_missing(rel)
+        sess = await client.start_session_for_notebook(rel, kernel_name=kernel_name)
+        return cls(
+            canonical=canonical,
+            server_relative=rel,
+            session_id=sess["id"],
+            kernel_id=sess["kernel"]["id"],
+            kernel_name=sess["kernel"]["name"],
+            client=client,
+        )
 
-            raise NotebookFileMissingError(str(path))
-
-        session = cls(path, nb)
-        await session.km.start_kernel()
-        session.kc = session.km.client()
-        session.kc.start_channels()
-        await session.kc.wait_for_ready(timeout=60)
-        # Persist immediately so a freshly-created notebook lands on disk.
-        session.writer.schedule()
-        await session.writer.flush()
-        return session
-
-    async def close(self) -> None:
-        """Shutdown kernel and writer, flush any pending writes."""
-        try:
-            await self.writer.flush()
-        finally:
-            await self.writer.close()
+    async def close(self, *, shutdown_kernel: bool = True) -> None:
+        if shutdown_kernel:
             try:
-                if self.kc is not None:
-                    self.kc.stop_channels()
+                await self.client.delete_session(self.session_id)
             except Exception:
                 pass
+
+    async def kernel_state(self) -> str:
+        try:
+            k = await self.client.get_kernel(self.kernel_id)
+            return k.get("execution_state", "unknown")
+        except Exception:
+            return "dead"
+
+    async def is_kernel_alive(self) -> bool:
+        try:
+            await self.client.get_kernel(self.kernel_id)
+            return True
+        except Exception:
+            return False
+
+    async def maybe_rejoin(self) -> bool:
+        """If a live "user" session exists for this notebook, switch to it.
+
+        Strategy:
+        - Find candidate sessions for this notebook: exact path match, plus
+          basename match (VS Code and Jupyter Server sometimes disagree on
+          path encoding — workspace-relative vs absolute — so a basename
+          fallback catches that case).
+        - Keep only those whose kernel is alive.
+        - Prefer a candidate whose kernel_id differs from ours. That's the
+          user's kernel (VS Code's), and the whole point of co-editing is
+          that Claude joins it.
+        - If our current binding is the only live one, do nothing.
+        - If our kernel is dead and a live other exists, switch.
+        """
+        from pathlib import Path as _P
+
+        sessions = await self.client.list_sessions()
+        basename = _P(self.server_relative).name
+
+        seen: set[str] = set()
+        candidates: list[dict] = []
+        for s in sessions:
+            sid = s.get("id")
+            if not sid or sid in seen:
+                continue
+            spath = s.get("path") or ""
+            if spath == self.server_relative or _P(spath).name == basename:
+                seen.add(sid)
+                candidates.append(s)
+        if not candidates:
+            return False
+
+        alive: list[dict] = []
+        for s in candidates:
             try:
-                if await self.km.is_alive():
-                    await self.km.shutdown_kernel(now=False)
+                await self.client.get_kernel(s["kernel"]["id"])
+                alive.append(s)
             except Exception:
-                # Best-effort: don't let a stuck kernel block close.
-                try:
-                    await self.km.shutdown_kernel(now=True)
-                except Exception:
-                    pass
+                pass
+        if not alive:
+            return False
 
-    async def assert_alive(self) -> None:
-        if not await self.km.is_alive():
-            raise KernelDiedError(str(self.path))
-
-    # --- cell lookup helpers ---
-
-    def resolve_cell_index(self, ref: int | str) -> int:
-        cells = self.nb.cells
-        if isinstance(ref, int):
-            if 0 <= ref < len(cells):
-                return ref
-            raise CellNotFoundError(ref)
-        # treat string as cell id
-        for i, cell in enumerate(cells):
-            if cell.get("id") == ref:
-                return i
-        raise CellNotFoundError(ref)
-
-    def cell_by_ref(self, ref: int | str) -> NotebookNode:
-        return self.nb.cells[self.resolve_cell_index(ref)]
-
-    # --- structural edits (callers must hold exec_lock) ---
-
-    def add_cell(
-        self, cell_type: str, source: str, index: int | None = None
-    ) -> tuple[int, str | None]:
-        if cell_type == "code":
-            cell = nbformat.v4.new_code_cell(source=source)
-        elif cell_type == "markdown":
-            cell = nbformat.v4.new_markdown_cell(source=source)
-        elif cell_type == "raw":
-            cell = nbformat.v4.new_raw_cell(source=source)
+        non_ours = [s for s in alive if s["kernel"]["id"] != self.kernel_id]
+        if non_ours:
+            pick = non_ours[0]
         else:
-            raise ValueError(f"unknown cell_type: {cell_type!r}")
-        if index is None or index >= len(self.nb.cells):
-            self.nb.cells.append(cell)
-            idx = len(self.nb.cells) - 1
-        else:
-            idx = max(0, index)
-            self.nb.cells.insert(idx, cell)
-        return idx, cell.get("id")
+            ours_alive = any(s["kernel"]["id"] == self.kernel_id for s in alive)
+            if ours_alive:
+                return False
+            pick = alive[0]
 
-    def edit_cell(self, ref: int | str, source: str) -> tuple[int, str | None]:
-        idx = self.resolve_cell_index(ref)
-        cell = self.nb.cells[idx]
-        cell["source"] = source
-        if cell.get("cell_type") == "code":
-            cell["outputs"] = []
-            cell["execution_count"] = None
-        return idx, cell.get("id")
+        if pick["kernel"]["id"] == self.kernel_id:
+            return False
+        self.session_id = pick["id"]
+        self.kernel_id = pick["kernel"]["id"]
+        self.kernel_name = pick["kernel"]["name"]
+        return True
 
-    def delete_cell(self, ref: int | str) -> None:
-        idx = self.resolve_cell_index(ref)
-        del self.nb.cells[idx]
+    async def rebind_to_kernel(self, target: str) -> bool:
+        """Rebind to the kernel matching `target` (kernel_id, session_id, or
+        kernel_id_prefix). Returns True if rebound.
+        """
+        sessions = await self.client.list_sessions()
+        for s in sessions:
+            if (
+                s["id"] == target
+                or s["kernel"]["id"] == target
+                or s["kernel"]["id"].startswith(target)
+            ):
+                self.session_id = s["id"]
+                self.kernel_id = s["kernel"]["id"]
+                self.kernel_name = s["kernel"]["name"]
+                return True
+        return False
 
-    def move_cell(self, from_ref: int | str, to_index: int) -> None:
-        src = self.resolve_cell_index(from_ref)
-        cell = self.nb.cells.pop(src)
-        to_index = max(0, min(to_index, len(self.nb.cells)))
-        self.nb.cells.insert(to_index, cell)
+    async def read_notebook(self) -> dict:
+        """Always fetch fresh from the server (source of truth)."""
+        return await self.client.read_notebook(self.server_relative)
 
-    def clear_outputs(self, ref: int | str | None) -> int:
-        cleared = 0
-        if ref is None:
-            for cell in self.nb.cells:
-                if cell.get("cell_type") == "code" and cell.get("outputs"):
-                    cell["outputs"] = []
-                    cell["execution_count"] = None
-                    cleared += 1
-        else:
-            idx = self.resolve_cell_index(ref)
-            cell = self.nb.cells[idx]
-            if cell.get("cell_type") == "code" and cell.get("outputs"):
-                cell["outputs"] = []
-                cell["execution_count"] = None
-                cleared = 1
-        return cleared
+    async def write_notebook(self, nb: dict) -> None:
+        await self.client.write_notebook(self.server_relative, nb)

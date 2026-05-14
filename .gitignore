@@ -21,3 +21,9 @@ wheels/
 
 # OS
 .DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+
+# MCP runtime
+.cache/

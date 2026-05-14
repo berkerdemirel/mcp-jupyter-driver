@@ -1,14 +1,15 @@
-"""Cell execution: send to kernel, consume iopub, write outputs back live.
+"""Cell execution via the Jupyter Server's kernel WebSocket.
 
-We treat the in-memory `nb` as the source of truth and the .ipynb file as a
-projection of it (re-written atomically + debounced as outputs arrive). The
-debounced writer collapses bursts; we flush before returning so the editor
-always sees the final state when the tool call ends.
+Both Claude (this module) and the user's editor connect to the same kernel
+through the server. Outputs come back on iopub; we apply them to the
+in-memory notebook and PUT the updated notebook through the Contents API so
+the editor's notebook view sees the result.
 """
 
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
@@ -16,18 +17,17 @@ import nbformat
 from nbformat.notebooknode import NotebookNode
 
 from . import widgets
-from .errors import InteractiveInputError, KernelDiedError
-from .session import NotebookSession
+from .errors import KernelDiedError
+from .session import NotebookSession, resolve_cell_index
 
 ProgressCb = Callable[[float, float | None, str], Awaitable[None]]
-# Per-message wait timeout while a cell is running; if a single iopub msg
-# doesn't arrive within this window we check whether the kernel is alive.
-IOPUB_TIMEOUT_S = 0.5
 
-# Output size caps. Individual outputs (stream text, traceback, single MIME
-# values) are truncated at MAX_OUTPUT_BYTES with a marker. Once a cell's
-# total accumulated payload exceeds MAX_CELL_BYTES, further outputs are
-# dropped and a single truncation marker is appended.
+# Per-recv wait timeout; on timeout we check kernel liveness.
+WS_TIMEOUT_S = 0.5
+# Debounce window for writing the notebook back during streaming output.
+WRITE_DEBOUNCE_S = 0.2
+
+# Per-output / per-cell size caps. Images & widget MIME are not capped.
 MAX_OUTPUT_BYTES = 1 * 1024 * 1024
 MAX_CELL_BYTES = 5 * 1024 * 1024
 _TRUNCATED = "\n…[mcp-jupyter-driver: output truncated]\n"
@@ -47,9 +47,12 @@ class CellResult:
     kernel_restarted: bool = False
 
 
+# ---- output helpers (pure, unit-testable) -----------------------------------
+
+
 def _truncate_str(s: str, limit: int = MAX_OUTPUT_BYTES) -> str:
     if isinstance(s, list):
-        s = "".join(s)
+        s = "".join(x for x in s if isinstance(x, str))
     if not isinstance(s, str):
         return s
     if len(s) <= limit:
@@ -58,7 +61,6 @@ def _truncate_str(s: str, limit: int = MAX_OUTPUT_BYTES) -> str:
 
 
 def _output_size(out: NotebookNode) -> int:
-    """Cheap size estimate of an output's payload (chars)."""
     otype = out.get("output_type")
     if otype == "stream":
         text = out.get("text", "")
@@ -77,9 +79,6 @@ def _output_size(out: NotebookNode) -> int:
 
 
 def _cap_output(out: NotebookNode) -> bool:
-    """Trim oversize fields in a single output in place. Returns True if any
-    field had to be truncated.
-    """
     trimmed = False
     otype = out.get("output_type")
     if otype == "stream":
@@ -103,7 +102,6 @@ def _cap_output(out: NotebookNode) -> bool:
 
 
 def _coalesce_stream(outputs: list[NotebookNode], new_out: NotebookNode) -> bool:
-    """If the previous output is a stream of the same name, merge text into it."""
     if not outputs:
         return False
     prev = outputs[-1]
@@ -112,9 +110,18 @@ def _coalesce_stream(outputs: list[NotebookNode], new_out: NotebookNode) -> bool
         and new_out.get("output_type") == "stream"
         and prev.get("name") == new_out.get("name")
     ):
-        prev["text"] = prev.get("text", "") + new_out.get("text", "")
+        prev_text = prev.get("text", "")
+        if isinstance(prev_text, list):
+            prev_text = "".join(prev_text)
+        new_text = new_out.get("text", "")
+        if isinstance(new_text, list):
+            new_text = "".join(new_text)
+        prev["text"] = prev_text + new_text
         return True
     return False
+
+
+# ---- main entrypoint --------------------------------------------------------
 
 
 async def run_cell(
@@ -125,120 +132,91 @@ async def run_cell(
     progress: ProgressCb | None = None,
     restart_on_kernel_death: bool = False,
 ) -> CellResult:
-    """Execute one cell and stream outputs back to the .ipynb file.
-
-    If the kernel dies mid-execution and `restart_on_kernel_death` is True,
-    the kernel is restarted before returning (result.kernel_restarted=True).
-    Otherwise raises KernelDiedError.
-    """
+    """Execute a cell against the shared kernel and write outputs back."""
     async with session.exec_lock:
-        await session.assert_alive()
-        cell_index = session.resolve_cell_index(ref)
-        cell = session.nb.cells[cell_index]
+        # If VS Code is using a different kernel for this notebook (or our
+        # kernel died), switch to a live one before we run.
+        await session.maybe_rejoin()
+        nb = await session.read_notebook()
+        idx = resolve_cell_index(nb, ref)
+        cell = nb["cells"][idx]
         if cell.get("cell_type") != "code":
             return CellResult(status="ok", execution_count=None, output_count=0)
 
         cell["outputs"] = []
         cell["execution_count"] = None
-        session.writer.schedule()
+        await session.write_notebook(nb)  # editor shows "running"
 
-        kc = session.kc
-        msg_id = kc.execute(cell.get("source", ""), store_history=True)
-
-        stdin_seen: list[bool] = [False]
-        stdin_task = asyncio.create_task(_handle_stdin(session, msg_id, stdin_seen))
         try:
-            result = await _consume_iopub(
-                session=session,
-                cell=cell,
-                msg_id=msg_id,
-                deadline=asyncio.get_event_loop().time() + timeout_s,
-                progress=progress,
-            )
+            async with session.client.kernel_channel(
+                session.kernel_id, session.session_id
+            ) as ch:
+                msg_id = await ch.send(
+                    "execute_request",
+                    {
+                        "code": cell.get("source", ""),
+                        "silent": False,
+                        "store_history": True,
+                        "user_expressions": {},
+                        "allow_stdin": True,
+                        "stop_on_error": True,
+                    },
+                )
+
+                result = await _consume(
+                    ch=ch,
+                    msg_id=msg_id,
+                    session=session,
+                    nb=nb,
+                    cell=cell,
+                    timeout_s=timeout_s,
+                    progress=progress,
+                )
+                if result.has_widget:
+                    await _snapshot_widgets(ch, nb)
         except KernelDiedError:
             if restart_on_kernel_death:
-                await session.km.restart_kernel(now=True)
-                result = CellResult(
+                try:
+                    await session.client.restart_kernel(session.kernel_id)
+                except Exception:
+                    raise
+                return CellResult(
                     status="kernel_died",
                     execution_count=None,
                     kernel_restarted=True,
                 )
-            else:
-                raise
-        finally:
-            stdin_task.cancel()
-            try:
-                await stdin_task
-            except (asyncio.CancelledError, Exception):
-                pass
-        if stdin_seen[0]:
-            result.interactive_input = True
+            raise
 
-        # Try to get the execution_count from the shell reply.
-        try:
-            shell_reply = await asyncio.wait_for(
-                _shell_reply_for(kc, msg_id), timeout=2.0
-            )
-            count = shell_reply.get("content", {}).get("execution_count")
-            if count is not None:
-                result.execution_count = count
-                cell["execution_count"] = count
-        except asyncio.TimeoutError:
-            pass
-
-        # Widget-state snapshot if this cell produced a widget view.
-        if result.has_widget:
-            await _snapshot_widget_state(session)
-
-        await session.writer.flush()
+        # Final write — outputs and execution_count now in place.
+        await session.write_notebook(nb)
         return result
 
 
-async def _handle_stdin(session: NotebookSession, msg_id: str, seen: list[bool]) -> None:
-    """Auto-reply empty string to input_request so a cell that called input()
-    doesn't hang forever. Flips `seen[0]` so the caller can surface this.
-    """
-    kc = session.kc
-    while True:
-        try:
-            msg = await kc.get_stdin_msg()
-        except Exception:
-            await asyncio.sleep(0.1)
-            continue
-        if (msg.get("parent_header") or {}).get("msg_id") != msg_id:
-            continue
-        if msg.get("msg_type") == "input_request":
-            seen[0] = True
-            try:
-                kc.input("")
-            except Exception:
-                pass
-
-
-async def _consume_iopub(
+async def _consume(
     *,
-    session: NotebookSession,
-    cell: NotebookNode,
+    ch,
     msg_id: str,
-    deadline: float,
+    session: NotebookSession,
+    nb: dict,
+    cell: dict,
+    timeout_s: float,
     progress: ProgressCb | None,
 ) -> CellResult:
     result = CellResult(status="ok", execution_count=None)
-    kc = session.kc
-    loop = asyncio.get_event_loop()
-    saw_idle_for_us = False
+    deadline = asyncio.get_event_loop().time() + timeout_s
     cell_bytes = 0
+    last_write = 0.0
     truncation_marker_added = False
+    saw_idle = False
+    shell_reply_seen = False
 
-    while not saw_idle_for_us:
-        if loop.time() > deadline:
-            # Soft timeout: don't kill the kernel, just stop streaming. Caller
-            # can interrupt explicitly if they want.
+    while not (saw_idle and shell_reply_seen):
+        if asyncio.get_event_loop().time() > deadline:
             cell["outputs"].append(
                 nbformat.v4.new_output(
                     output_type="stream",
                     name="stderr",
-                    text=f"\n[mcp-jupyter-driver] cell timed out after {deadline:.0f}s; "
+                    text=f"\n[mcp-jupyter-driver] cell timed out after {timeout_s:.0f}s; "
                     f"call interrupt_kernel to stop the kernel.\n",
                 )
             )
@@ -248,9 +226,11 @@ async def _consume_iopub(
             return result
 
         try:
-            msg = await asyncio.wait_for(kc.get_iopub_msg(), timeout=IOPUB_TIMEOUT_S)
+            msg = await ch.recv(timeout=WS_TIMEOUT_S)
         except asyncio.TimeoutError:
-            if not await session.km.is_alive():
+            try:
+                await session.client.get_kernel(session.kernel_id)
+            except Exception:
                 cell["outputs"].append(
                     nbformat.v4.new_output(
                         output_type="error",
@@ -262,43 +242,68 @@ async def _consume_iopub(
                 result.status = "kernel_died"
                 result.error_name = "KernelDied"
                 result.error_value = "kernel exited during execution"
-                await session.writer.flush()
-                raise KernelDiedError(str(session.path))
+                await session.write_notebook(nb)
+                raise KernelDiedError(session.canonical)
             continue
 
-        parent = (msg.get("parent_header") or {}).get("msg_id")
-        if parent != msg_id:
-            # Not ours (e.g. silent kernel-side helper from another caller).
+        if (msg.get("parent_header") or {}).get("msg_id") != msg_id:
             continue
 
-        msg_type = msg.get("msg_type") or msg.get("header", {}).get("msg_type")
+        channel = msg.get("channel")
+        mt = msg.get("msg_type") or (msg.get("header") or {}).get("msg_type")
         content = msg.get("content", {})
 
-        if msg_type == "status":
-            if content.get("execution_state") == "idle":
-                saw_idle_for_us = True
+        if channel == "stdin":
+            if mt == "input_request":
+                # Auto-reply empty so the cell doesn't hang.
+                try:
+                    await ch.send(
+                        "input_reply", {"value": ""}, channel="stdin"
+                    )
+                except Exception:
+                    pass
+                # We have to surface this to the caller; set a marker by
+                # appending a stderr note. The caller checks result.interactive_input.
+                result.interactive_input = True
             continue
 
-        if msg_type == "execute_input":
+        if channel == "shell":
+            if mt == "execute_reply":
+                shell_reply_seen = True
+                if content.get("execution_count") is not None:
+                    result.execution_count = content["execution_count"]
+                    cell["execution_count"] = content["execution_count"]
+            continue
+
+        # channel == "iopub" (or unspecified)
+        if mt == "status":
+            if content.get("execution_state") == "idle":
+                saw_idle = True
+            continue
+
+        if mt == "execute_input":
             count = content.get("execution_count")
             if count is not None:
-                cell["execution_count"] = count
                 result.execution_count = count
+                cell["execution_count"] = count
             continue
 
-        if msg_type in ("comm_open", "comm_msg", "comm_close"):
-            _record_comm(session, msg_type, content)
+        if mt in ("comm_open", "comm_msg", "comm_close"):
             continue
 
-        if msg_type in ("stream", "display_data", "execute_result", "error", "update_display_data"):
+        if mt in (
+            "stream",
+            "display_data",
+            "execute_result",
+            "error",
+            "update_display_data",
+        ):
             try:
                 out = nbformat.v4.output_from_msg(msg)
             except Exception:
                 continue
 
             if cell_bytes >= MAX_CELL_BYTES:
-                # Already past the cap; drop further outputs after appending
-                # exactly one marker.
                 if not truncation_marker_added:
                     cell["outputs"].append(
                         nbformat.v4.new_output(
@@ -307,7 +312,6 @@ async def _consume_iopub(
                     )
                     truncation_marker_added = True
                     result.truncated = True
-                    session.writer.schedule()
                 continue
 
             if _cap_output(out):
@@ -316,7 +320,7 @@ async def _consume_iopub(
             if cell_bytes + this_size > MAX_CELL_BYTES:
                 result.truncated = True
 
-            if msg_type == "stream":
+            if mt == "stream":
                 if not _coalesce_stream(cell["outputs"], out):
                     cell["outputs"].append(out)
             else:
@@ -324,7 +328,7 @@ async def _consume_iopub(
 
             cell_bytes += this_size
 
-            if msg_type == "error":
+            if mt == "error":
                 result.status = "error"
                 result.error_name = content.get("ename")
                 result.error_value = content.get("evalue")
@@ -334,81 +338,67 @@ async def _consume_iopub(
                 result.has_widget = True
 
             result.output_count = len(cell["outputs"])
-            session.writer.schedule()
+
+            now = time.monotonic()
+            if now - last_write >= WRITE_DEBOUNCE_S:
+                last_write = now
+                try:
+                    await session.write_notebook(nb)
+                except Exception:
+                    pass
+
             if progress is not None:
                 try:
                     await progress(
-                        float(result.output_count),
-                        None,
-                        f"{msg_type} ({result.output_count} outputs)",
+                        float(result.output_count), None,
+                        f"{mt} ({result.output_count})",
                     )
                 except Exception:
                     pass
             continue
 
-        # Unknown message type: ignore silently to stay forward-compatible.
-
     return result
 
 
-async def _shell_reply_for(kc: Any, msg_id: str) -> dict[str, Any]:
-    """Drain shell channel until we see a reply with our parent msg_id."""
-    while True:
-        msg = await kc.get_shell_msg()
-        if (msg.get("parent_header") or {}).get("msg_id") == msg_id:
-            return msg
-
-
-def _record_comm(session: NotebookSession, msg_type: str, content: dict[str, Any]) -> None:
-    comm_id = content.get("comm_id")
-    if not comm_id:
-        return
-    if msg_type == "comm_open":
-        session.widget_comms[comm_id] = {
-            "target_name": content.get("target_name"),
-            "data": content.get("data"),
-        }
-    elif msg_type == "comm_msg":
-        entry = session.widget_comms.setdefault(comm_id, {})
-        entry["last_data"] = content.get("data")
-    elif msg_type == "comm_close":
-        session.widget_comms.pop(comm_id, None)
-
-
-async def _snapshot_widget_state(session: NotebookSession) -> None:
-    """Ask the kernel for its current ipywidgets manager state, write to nb.metadata."""
-    kc = session.kc
-    # NOTE: silent=True suppresses iopub stream output entirely, which would
-    # hide our sentinel-wrapped stdout. Use store_history=False so the
-    # helper doesn't pollute the user's history.
-    msg_id = kc.execute(
-        widgets.snapshot_request_code(),
-        silent=False,
-        store_history=False,
-        allow_stdin=False,
+async def _snapshot_widgets(ch, nb: dict) -> None:
+    """Run silent helper on the existing channel; install state into nb.metadata."""
+    msg_id = await ch.send(
+        "execute_request",
+        {
+            "code": widgets.snapshot_request_code(),
+            "silent": False,
+            "store_history": False,
+            "user_expressions": {},
+            "allow_stdin": False,
+            "stop_on_error": True,
+        },
     )
     collected: list[str] = []
-    loop = asyncio.get_event_loop()
-    deadline = loop.time() + 5.0
-    while True:
-        if loop.time() > deadline:
+    deadline = asyncio.get_event_loop().time() + 5.0
+    saw_idle = False
+    shell_reply_seen = False
+    while not (saw_idle and shell_reply_seen):
+        if asyncio.get_event_loop().time() > deadline:
             return
         try:
-            msg = await asyncio.wait_for(kc.get_iopub_msg(), timeout=IOPUB_TIMEOUT_S)
+            msg = await ch.recv(timeout=WS_TIMEOUT_S)
         except asyncio.TimeoutError:
-            if not await session.km.is_alive():
-                return
             continue
         if (msg.get("parent_header") or {}).get("msg_id") != msg_id:
             continue
-        msg_type = msg.get("msg_type") or msg.get("header", {}).get("msg_type")
+        mt = msg.get("msg_type")
         content = msg.get("content", {})
-        if msg_type == "stream" and content.get("name") == "stdout":
-            collected.append(content.get("text", ""))
-        elif msg_type == "status" and content.get("execution_state") == "idle":
-            break
+        if msg.get("channel") == "shell" and mt == "execute_reply":
+            shell_reply_seen = True
+            continue
+        if mt == "stream" and content.get("name") == "stdout":
+            text = content.get("text", "")
+            if isinstance(text, list):
+                text = "".join(text)
+            collected.append(text)
+        elif mt == "status" and content.get("execution_state") == "idle":
+            saw_idle = True
 
     snapshot = widgets.parse_snapshot_stdout("".join(collected))
     if snapshot is not None:
-        widgets.install_widget_state(session.nb.metadata, snapshot)
-        session.writer.schedule()
+        widgets.install_widget_state(nb.setdefault("metadata", {}), snapshot)

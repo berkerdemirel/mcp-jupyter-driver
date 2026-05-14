@@ -1,21 +1,41 @@
 # mcp-jupyter-driver
 
-An MCP server that lets Claude drive Jupyter notebooks with a **persistent
-kernel**, while you watch the notebook update **live in your editor** (VS Code,
-JupyterLab, etc.).
+An MCP server that lets Claude and you **co-edit a Jupyter notebook against
+the same kernel**. Variables you set are visible to Claude; cells Claude
+runs are visible to you. Variables persist in the kernel even if the cell
+that defined them is deleted, because the kernel is shared and decoupled
+from the notebook file.
 
-## Why
+## How it works
 
-Claude's default notebook handling re-runs everything or shells out to a
-script — throwing away the main value of a notebook: a kernel that stays
-warm so heavy setup (loading data, training, fitting) happens once and dozens
-of cheap exploratory cells (filter, plot, summary, prompt iteration) reuse
-the in-memory state.
+The MCP supervises a `jupyter server` subprocess on localhost. Both Claude
+(through the MCP) and your editor (VS Code → "Existing Jupyter Server")
+connect to that single server, share its kernels, and read/write the same
+`.ipynb` via the server's Contents API. There is exactly one writer for the
+file (the server), so there are no save conflicts.
 
-This MCP gives Claude human-level access to a notebook (open / run a cell /
-add a cell / inspect state / restart) while keeping the `.ipynb` file on disk
-as the live UI: every output stream is written back atomically as the cell
-runs, so the editor sees updates as they happen. No web UI to install.
+Architecturally:
+
+```
+                  ┌──────────────────────┐
+   Claude  ───►   │   mcp-jupyter-driver │
+                  │   (MCP server)        │
+                  └─────────┬─────────────┘
+                            │ REST + WebSocket
+                            ▼
+                  ┌──────────────────────┐
+                  │   jupyter server      │  ◄── VS Code
+                  │   (subprocess)        │      "Existing Jupyter Server"
+                  │   - Contents API      │
+                  │   - Kernels API       │
+                  │   - WebSocket channels│
+                  └─────────┬─────────────┘
+                            │
+                            ▼
+                  ┌──────────────────────┐
+                  │   ipykernel(s)        │
+                  └──────────────────────┘
+```
 
 ## Install
 
@@ -28,119 +48,170 @@ uv sync
 uv run python -m mcp_jupyter_driver --self-check
 ```
 
-Register with Claude Code — add to `~/.claude.json` under `mcpServers`:
+Register with Claude Code — add to `~/.claude.json` under the right
+`mcpServers` object (project-scoped or user-scoped):
 
 ```json
 {
-  "mcpServers": {
-    "jupyter": {
-      "type": "stdio",
-      "command": "uv",
-      "args": [
-        "--directory", "/absolute/path/to/mcp-jupyter-driver",
-        "run", "python", "-m", "mcp_jupyter_driver"
-      ]
-    }
+  "jupyter": {
+    "type": "stdio",
+    "command": "uv",
+    "args": [
+      "--directory", "/absolute/path/to/mcp-jupyter-driver",
+      "run", "python", "-m", "mcp_jupyter_driver"
+    ]
   }
 }
 ```
 
-Then restart Claude Code. `claude mcp` should list `jupyter`.
+Restart Claude Code. `/mcp` should list `jupyter` with all tools.
+
+## Use your real Python environment for the kernel
+
+By default the kernel runs in the `python3` kernelspec, which is the MCP's
+own uv-managed venv (minimal packages). To run your data-science stack
+(pandas, torch, sklearn, etc.) install `ipykernel` in *your* env and register
+it once:
+
+```bash
+# from inside your conda/uv/venv environment
+pip install ipykernel
+python -m ipykernel install --user --name myenv --display-name "myenv"
+```
+
+Then when opening a notebook from Claude, pass `kernel_name="myenv"`:
+
+> "Open `/path/to/work.ipynb` with kernel `myenv`."
+
+List available kernels via the `list_kernelspecs` tool.
+
+## Connect VS Code to the same server (one-time setup)
+
+1. Start a Claude Code session with this MCP enabled.
+2. Ask Claude to call `jupyter_server_info`. It returns `url_with_token`,
+   a single string of the form `http://127.0.0.1:<port>/?token=<token>`.
+3. In VS Code, open the `.ipynb` you want to work on (notebook view).
+4. Top right, click the kernel picker → **"Select Another Kernel..."** →
+   **"Existing Jupyter Server..."** → paste `url_with_token` into the URL
+   box (one string — the token is embedded as a query parameter, which is
+   what VS Code expects). Give the server any nickname.
+5. After it connects, you'll see kernels listed. Pick the one Claude is
+   using (or pick any — VS Code will route the notebook to a kernel from
+   this server, and `open_notebook` from Claude will reuse the same session
+   if you pass the same path).
+
+If VS Code warns about an insecure server, that means the URL is missing
+the `?token=...` suffix. Make sure you pasted `url_with_token`, not just
+`url`.
+
+After this, runs you trigger from VS Code's UI and runs Claude triggers via
+the MCP both hit the same kernel. Variables flow between you.
+
+The URL+token are also written to `~/.cache/mcp-jupyter-driver/connection.json`
+for convenience.
 
 ## Tool surface
 
-**Lifecycle**
+**Server / lifecycle**
 
 | Tool | What it does |
 |---|---|
-| `open_notebook(path, create_if_missing=False)` | Load a `.ipynb` and start a kernel for it. |
-| `close_notebook(path)` | Shutdown the kernel and forget the notebook. |
-| `list_open_notebooks()` | All notebooks open in this session. |
+| `jupyter_server_info()` | Returns the URL + token for the local Jupyter Server. Paste into VS Code's "Existing Jupyter Server" dialog. |
+| `list_kernelspecs()` | Kernelspec names available on the server. |
+| `open_notebook(path, create_if_missing=False, kernel_name="python3")` | Open a notebook + bind a session/kernel. Uses the server's Contents API. |
+| `close_notebook(path, shutdown_kernel=True)` | Close the session. |
+| `list_open_notebooks()` | All notebooks open in this MCP session. |
+| `refresh_notebook(path)` | Force-refresh handle (every tool already re-reads on entry). |
 
-**Cell editing**
+**Cell editing** (all go through the server's Contents API)
 
 | Tool | What it does |
 |---|---|
-| `add_cell(path, cell_type, source, index=None)` | Insert a new code/markdown/raw cell. Returns its index and id. |
+| `add_cell(path, cell_type, source, index=None)` | Insert a new code/markdown/raw cell. |
 | `edit_cell(path, ref, source)` | Replace a cell's source. Clears outputs for code cells. |
-| `delete_cell(path, ref)` | Remove a cell by index or id. |
-| `move_cell(path, from_ref, to_index)` | Reorder a cell. |
-| `clear_cell_outputs(path, ref=None)` | Clear outputs (one cell or all code cells). |
-| `list_cells(path)` | Cells with index, id, type, source preview, exec count. |
-| `get_cell(path, ref)` | Full source + outputs of one cell. |
+| `delete_cell(path, ref)` | Remove a cell. |
+| `move_cell(path, from_ref, to_index)` | Reorder. |
+| `clear_cell_outputs(path, ref=None)` | Clear outputs (one cell or all). |
+| `list_cells(path)` | Index, id, type, source preview, exec count. |
+| `get_cell(path, ref)` | Full source + outputs. |
 
-**Execution**
+**Execution** (over kernel WebSocket — shared with VS Code)
 
 | Tool | What it does |
 |---|---|
-| `run_cell(path, ref, timeout_s=120, restart_on_kernel_death=False)` | Execute a cell. Outputs stream into the `.ipynb` live. |
+| `run_cell(path, ref, timeout_s=120, restart_on_kernel_death=False)` | Execute a cell. Outputs stream into the file via the server. |
 | `run_code(path, source, persist_as_cell=False, timeout_s=120)` | Append-and-run; optionally remove the cell after. |
+
+**Introspection** (live kernel state, decoupled from notebook contents)
+
+| Tool | What it does |
+|---|---|
+| `list_variables(path, include_private=False)` | User variables in the live kernel. **Survives cell deletion** — variables live in the kernel, not the notebook. |
+| `inspect_variable(path, name, max_repr_len=2000)` | Deep inspect (pandas: columns/dtypes/head; numpy: shape/dtype). |
+| `complete(path, source, cursor_pos)` | Kernel-driven completion. |
 
 **Kernel control**
 
 | Tool | What it does |
 |---|---|
 | `kernel_status(path)` | Is the kernel alive? Busy? |
-| `interrupt_kernel(path)` | SIGINT the kernel (stop a runaway cell). |
-| `restart_kernel(path, clear_outputs=False)` | Restart the kernel. |
+| `interrupt_kernel(path)` | SIGINT the kernel. |
+| `restart_kernel(path, clear_outputs=False)` | Restart. |
 
-**Introspection**
+**Kernel sharing diagnostics**
 
 | Tool | What it does |
 |---|---|
-| `list_variables(path, include_private=False)` | User variables in the live kernel: name, type, size hint, repr preview. |
-| `inspect_variable(path, name, max_repr_len=2000)` | Deep inspect one variable (pandas: columns/dtypes/head; numpy: shape/dtype). |
-| `complete(path, source, cursor_pos)` | Kernel-driven completion. |
+| `list_jupyter_sessions(path=None)` | All sessions/kernels on the local server. `is_claudes` flags the one Claude is bound to. Use this when you suspect you and Claude are on different kernels. |
+| `rebind_kernel(path, target)` | Point Claude's notebook session at a specific kernel. `target` can be a kernel_id, session_id, or kernel_id prefix (8 chars). |
 
-## Usage pattern
+Claude also **auto-rejoins** your kernel before each `run_cell` / `list_variables` /
+etc. if it detects a live session for the same notebook (matched by exact
+path or by basename, since VS Code and Jupyter Server sometimes disagree on
+path encoding).
 
-In a Claude Code session:
+## A typical workflow
 
-1. Open the `.ipynb` in VS Code (or JupyterLab) on one side. Make sure to use
-   the notebook view, not the JSON view.
-2. Ask Claude: *"Open `path/to/exploration.ipynb` and run the first cell."*
-3. Claude calls `open_notebook` (kernel starts), then `run_cell`. The output
-   appears in VS Code as it streams in.
-4. Iterate: *"Add a cell that filters by date and plots it."* Cell appears,
-   runs against the kernel that already has your data loaded.
+1. In VS Code: open your notebook in notebook view.
+2. In a Claude Code session (with this MCP active), ask:
+   > Get the Jupyter server info.
+   Claude calls `jupyter_server_info` and tells you the URL+token.
+3. In VS Code: connect to "Existing Jupyter Server" with that URL+token. Pick
+   a kernel (or your registered `myenv`).
+4. From Claude, open the same notebook:
+   > Open `/path/to/work.ipynb` with kernel `myenv`.
+5. Drive it together. Examples:
+   - You add a cell that loads an image, run it from VS Code.
+   - Ask Claude: *"Add a cell that shows the histogram of that image."* —
+     Claude reads the live notebook, adds a cell, runs it against the same
+     kernel.
+   - You add a cell that flips the image, run it. The variable update lives
+     in the shared kernel; ask Claude to inspect it.
+   - Delete a cell in VS Code. Variables it created stay alive. Claude can
+     still use them.
 
-The kernel stays alive across every tool call in the session. Restart it
-explicitly with `restart_kernel`.
+## Failure-mode behavior
 
-## ipywidgets
-
-Widgets work day one (pass-through). When a cell produces an `ipywidgets`
-view (e.g. `IntSlider`), the widget MIME bundle is preserved in the cell
-output and the kernel-side widget state is snapshotted into
-`nb.metadata.widgets` on save — so VS Code's notebook renderer shows a live,
-interactive widget. Claude can create and display widgets; programmatically
-driving widget state from Claude (clicking buttons, moving sliders via the
-server) is not in v1.
-
-## Known limitations (v1)
-
-- **Claude owns the file while a notebook is open.** Manual edits to the
-  `.ipynb` while a session is open may be overwritten on the next
-  cell-output write. Close the notebook first if you want to hand-edit.
-- **One execution at a time per kernel.** Matches Jupyter's model.
-  Cross-notebook execution is parallel.
-- **Large outputs are capped.** Per-output text caps at 1 MB, per-cell total
-  at 5 MB; oversize content is truncated with an explicit marker. Images,
-  widget MIME, and JSON bundles are left intact.
-- **Cells that call `input()` won't hang.** The server auto-replies with an
-  empty string and sets `interactive_input=True` on the run result so you
-  know it happened. Rewrite the cell to not block on stdin.
+- **Per-output cap 1 MB, per-cell total 5 MB** — text/JSON outputs over the cap
+  get truncated with a marker. Images and widget MIME aren't capped.
+- **`input()` doesn't hang** — the MCP auto-replies with `""` and sets
+  `interactive_input=True` on the result.
+- **Kernel death** — `run_cell(restart_on_kernel_death=True)` recovers; otherwise raises.
+- **ipywidgets** — the widget MIME is preserved and a state snapshot is
+  written into `nb.metadata.widgets` after each widget-producing cell so
+  VS Code/JupyterLab can render the live widget.
 
 ## Development
 
 ```bash
 uv sync
-uv run pytest          # 26 tests (unit + kernel integration)
+uv run pytest          # 20 tests (helpers + server-backed integration)
 uv run python -m mcp_jupyter_driver --self-check
 ```
 
 ## Security
 
-The MCP runs arbitrary Python code in whichever environment runs the server.
-Run as your normal user; do not run elevated, and don't point it at
-untrusted notebooks unless you'd already trust their code.
+The Jupyter Server we host listens on `127.0.0.1` only and uses a random
+token per launch. Anyone with the token has full Contents-API access to your
+filesystem and can execute arbitrary code through the kernel. Don't share
+the token. Don't run this as root.
