@@ -1,0 +1,36 @@
+{
+  "name": "mcp-jupyter-driver-sync",
+  "displayName": "mcp-jupyter-driver: notebook sync",
+  "description": "Auto-revert .ipynb notebooks when Claude (via mcp-jupyter-driver) writes them, so collaboration feels live.",
+  "version": "0.1.0",
+  "publisher": "mcp-jupyter-driver",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Notebooks"],
+  "activationEvents": [
+    "onNotebook:jupyter-notebook"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "mcpJupyterDriverSync.revertActive",
+        "title": "mcp-jupyter-driver: Revert active notebook from disk"
+      }
+    ],
+    "configuration": {
+      "title": "mcp-jupyter-driver sync",
+      "properties": {
+        "mcpJupyterDriverSync.debounceMs": {
+          "type": "number",
+          "default": 350,
+          "description": "Debounce window for back-to-back external writes (e.g. run_cell streaming output flushes every 200 ms). Auto-revert fires this many milliseconds after the latest change."
+        },
+        "mcpJupyterDriverSync.autoRevertWhenClean": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically revert externally-modified notebooks whose in-memory copy is not dirty. When the editor IS dirty, a status-bar item is shown instead."
+        }
+      }
+    }
+  }
+}
