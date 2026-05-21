@@ -32,14 +32,36 @@ class _InMemoryClient:
         self.write_count = 0
         self.last_written: dict | None = None
         self.deleted_sessions: list[str] = []
+        # Monotonically incremented on every write so tests can simulate
+        # last_modified drift against the if_unmodified_since precondition.
+        self._version = 0
+        self.last_modified = f"v{self._version}"
 
     async def read_notebook(self, path: str) -> dict:
         return copy.deepcopy(self.notebook)
 
-    async def write_notebook(self, path: str, nb: dict) -> dict:
+    async def read_notebook_with_meta(self, path: str) -> tuple[dict, str]:
+        # Delegate through ``self.read_notebook`` so tests that patch
+        # ``client.read_notebook`` to inject mid-flow mutations also affect
+        # the fresh re-read inside ``mutate_notebook_fresh``.
+        content = await self.read_notebook(path)
+        return content, self.last_modified
+
+    async def get_mtime(self, path: str) -> str:
+        return self.last_modified
+
+    async def write_notebook(
+        self, path: str, nb: dict, *, if_unmodified_since: str | None = None
+    ) -> dict:
+        if if_unmodified_since is not None and if_unmodified_since != self.last_modified:
+            from mcp_jupyter_driver.errors import ConcurrentWriteError
+
+            raise ConcurrentWriteError(path, if_unmodified_since, self.last_modified)
         self.notebook = nb
         self.last_written = nb
         self.write_count += 1
+        self._version += 1
+        self.last_modified = f"v{self._version}"
         return {}
 
     async def list_sessions(self) -> list[dict]:

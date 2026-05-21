@@ -51,6 +51,24 @@ class CellNotFoundError(NotebookConflictError):
         self.ref = ref
 
 
+class ConcurrentWriteError(NotebookConflictError):
+    """Raised when ``write_notebook(if_unmodified_since=...)`` detects that
+    the server's ``last_modified`` advanced between the caller's read and
+    the PUT — i.e. someone else (typically VS Code) saved the notebook in
+    that window. Retry by re-reading and re-applying the mutation.
+    """
+
+    def __init__(self, path: str, expected: str, actual: str) -> None:
+        super().__init__(
+            f"{path}: notebook was modified by another writer between read "
+            f"and write (expected last_modified={expected!r}, "
+            f"server now reports {actual!r}). Re-read and retry."
+        )
+        self.path = path
+        self.expected = expected
+        self.actual = actual
+
+
 class KernelDiedError(DriverError):
     def __init__(self, path: str) -> None:
         super().__init__(

@@ -70,8 +70,45 @@ class JupyterClient:
         r.raise_for_status()
         return r.json()["content"]
 
-    async def write_notebook(self, path: str, nb: dict) -> dict:
-        """PUT notebook content. Returns the updated server metadata."""
+    async def read_notebook_with_meta(self, path: str) -> tuple[dict, str | None]:
+        """GET notebook content + last_modified. Returns (content, last_modified).
+
+        ``last_modified`` is the server-reported mtime string; pass it back
+        through ``write_notebook(..., if_unmodified_since=...)`` to detect a
+        concurrent write between read and PUT.
+        """
+        r = await self._http.get(
+            f"/api/contents/{_encode_path(path)}",
+            params={"type": "notebook", "content": "1"},
+        )
+        r.raise_for_status()
+        body = r.json()
+        return body["content"], body.get("last_modified")
+
+    async def write_notebook(
+        self,
+        path: str,
+        nb: dict,
+        *,
+        if_unmodified_since: str | None = None,
+    ) -> dict:
+        """PUT notebook content. Returns the updated server metadata.
+
+        ``if_unmodified_since`` is an optimistic precondition: if provided, we
+        first GET the current server-side ``last_modified`` and compare. If
+        the server's value differs, raise ``ConcurrentWriteError`` instead of
+        PUTting (so a concurrent editor's write isn't clobbered). The Contents
+        API has no native conditional-PUT, so this is a best-effort
+        client-side check — a small race window remains, but it shrinks the
+        read→write race from the caller's perspective to the time between this
+        method's own GET and PUT.
+        """
+        if if_unmodified_since is not None:
+            current = await self.get_mtime(path)
+            if current is not None and current != if_unmodified_since:
+                from .errors import ConcurrentWriteError
+
+                raise ConcurrentWriteError(path, if_unmodified_since, current)
         body = {"type": "notebook", "format": "json", "content": nb}
         r = await self._http.put(
             f"/api/contents/{_encode_path(path)}", json=body

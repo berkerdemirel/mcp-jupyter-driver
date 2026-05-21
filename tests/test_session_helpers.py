@@ -10,7 +10,11 @@ from __future__ import annotations
 
 import pytest
 
-from mcp_jupyter_driver.errors import CellNotFoundError, NotebookConflictError
+from mcp_jupyter_driver.errors import (
+    CellNotFoundError,
+    ConcurrentWriteError,
+    NotebookConflictError,
+)
 from mcp_jupyter_driver.session import (
     NotebookSession,
     RebindOutcome,
@@ -297,15 +301,37 @@ class _NotebookFakeClient:
     def __init__(self, notebook: dict) -> None:
         self.notebook = notebook
         self.last_written: dict | None = None
+        self._version = 0
+        self.last_modified = f"v{self._version}"
 
     async def read_notebook(self, path: str) -> dict:
         # Hand back a deep-ish copy so test mutation can't leak into our state.
         import copy
         return copy.deepcopy(self.notebook)
 
-    async def write_notebook(self, path: str, nb: dict) -> dict:
+    async def read_notebook_with_meta(self, path: str) -> tuple[dict, str]:
+        # Delegate through ``read_notebook`` so test patches on it still
+        # affect the fresh re-read inside ``mutate_notebook_fresh``.
+        content = await self.read_notebook(path)
+        return content, self.last_modified
+
+    async def get_mtime(self, path: str) -> str:
+        return self.last_modified
+
+    async def write_notebook(
+        self, path: str, nb: dict, *, if_unmodified_since: str | None = None
+    ) -> dict:
+        if (
+            if_unmodified_since is not None
+            and if_unmodified_since != self.last_modified
+        ):
+            from mcp_jupyter_driver.errors import ConcurrentWriteError
+
+            raise ConcurrentWriteError(path, if_unmodified_since, self.last_modified)
         self.notebook = nb
         self.last_written = nb
+        self._version += 1
+        self.last_modified = f"v{self._version}"
         return {}
 
 
@@ -503,6 +529,75 @@ async def test_clear_all_outputs_pattern_does_not_revert_source_edits() -> None:
     assert cell["source"] == "x = 2  # user edit"
     assert cell["outputs"] == []
     assert cell["execution_count"] is None
+
+
+@pytest.mark.asyncio
+async def test_mutate_notebook_fresh_retries_on_transient_concurrent_write() -> None:
+    """If the server's last_modified ticks once between our read and our PUT,
+    ``mutate_notebook_fresh`` should re-read and re-apply transparently —
+    Claude shouldn't see the race.
+    """
+    client = _NotebookFakeClient(_nb([
+        {"id": "a", "cell_type": "code", "source": "x = 1", "outputs": [], "execution_count": None},
+    ]))
+    session = _make_session(client=client)  # type: ignore[arg-type]
+
+    real_meta = client.read_notebook_with_meta
+    fires = {"n": 0}
+
+    async def _meta_then_bump_once(p: str):
+        content, mtime = await real_meta(p)
+        fires["n"] += 1
+        # Bump the server's mtime AFTER returning the caller's view of it,
+        # simulating another writer (VS Code) saving between our read and PUT.
+        if fires["n"] == 1:
+            client._version += 1
+            client.last_modified = f"v{client._version}"
+        return content, mtime
+
+    client.read_notebook_with_meta = _meta_then_bump_once  # type: ignore[assignment]
+
+    def _set_source(nb: dict) -> None:
+        nb["cells"][0]["source"] = "x = 99"
+
+    await session.mutate_notebook_fresh(_set_source, operation_name="test")
+
+    # The write eventually went through after retry; final state is our edit.
+    assert client.notebook["cells"][0]["source"] == "x = 99"
+    # And we re-read at least twice (initial + retry).
+    assert fires["n"] >= 2
+
+
+@pytest.mark.asyncio
+async def test_mutate_notebook_fresh_raises_on_persistent_concurrent_write() -> None:
+    """If something keeps bumping last_modified between every read and every
+    write, retries eventually exhaust and we surface the conflict instead of
+    spinning forever.
+    """
+    client = _NotebookFakeClient(_nb([
+        {"id": "a", "cell_type": "code", "source": "x = 1", "outputs": [], "execution_count": None},
+    ]))
+    session = _make_session(client=client)  # type: ignore[arg-type]
+
+    real_meta = client.read_notebook_with_meta
+
+    async def _always_bump(p: str):
+        content, mtime = await real_meta(p)
+        # Bump the server's mtime after every read so every PUT precondition fails.
+        client._version += 1
+        client.last_modified = f"v{client._version}"
+        return content, mtime
+
+    client.read_notebook_with_meta = _always_bump  # type: ignore[assignment]
+
+    def _set_source(nb: dict) -> None:
+        nb["cells"][0]["source"] = "x = 99"
+
+    with pytest.raises(ConcurrentWriteError):
+        await session.mutate_notebook_fresh(_set_source, operation_name="test")
+
+    # The PUT must never have landed.
+    assert client.notebook["cells"][0]["source"] == "x = 1"
 
 
 @pytest.mark.asyncio

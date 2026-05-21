@@ -17,9 +17,18 @@ from typing import Callable, Literal
 from .client import JupyterClient
 from .errors import (
     CellNotFoundError,
+    ConcurrentWriteError,
     NotebookConflictError,
     NotebookFileMissingError,
 )
+
+
+# Bounded retry count for ``mutate_notebook_fresh`` on ``ConcurrentWriteError``.
+# Three total attempts gives the user one save-storm bounce without burning
+# tool budget on persistent races. Each retry re-reads then re-applies the
+# mutator on the freshest server-side state, so retries remain correct as
+# long as the mutator is a function of the input notebook.
+_MUTATE_RETRY_ATTEMPTS = 3
 
 
 _UUID_RE = re.compile(
@@ -355,8 +364,18 @@ class NotebookSession:
         """Always fetch fresh from the server (source of truth)."""
         return await self.client.read_notebook(self.server_relative)
 
-    async def write_notebook(self, nb: dict) -> None:
-        await self.client.write_notebook(self.server_relative, nb)
+    async def read_notebook_with_meta(self) -> tuple[dict, str | None]:
+        """Like ``read_notebook`` but also returns the server's ``last_modified``
+        so the caller can pass it back as a write precondition.
+        """
+        return await self.client.read_notebook_with_meta(self.server_relative)
+
+    async def write_notebook(
+        self, nb: dict, *, if_unmodified_since: str | None = None
+    ) -> None:
+        await self.client.write_notebook(
+            self.server_relative, nb, if_unmodified_since=if_unmodified_since
+        )
 
     async def mutate_notebook_fresh(
         self,
@@ -376,7 +395,10 @@ class NotebookSession:
 
         Preconditions are checked on the **fresh** read (not on whatever
         snapshot the caller used earlier), so they catch the read→write race
-        window that ``exec_lock`` alone can't close.
+        window that ``exec_lock`` alone can't close. The fresh read also
+        captures ``last_modified``, which we re-check just before the PUT so
+        the (small) window between our own read and PUT also raises
+        ``ConcurrentWriteError`` instead of silently clobbering.
 
         - ``expected_cell_id``: the notebook must still contain a cell with
           this id, or ``NotebookConflictError`` is raised. Use it for
@@ -392,32 +414,47 @@ class NotebookSession:
         ``None`` keeps that dict, or it may return a new dict to replace it
         entirely.
         """
-        nb = await self.read_notebook()
-        if expected_cell_id is not None:
-            cells = nb.get("cells") or []
-            found = None
-            for c in cells:
-                if c.get("id") == expected_cell_id:
-                    found = c
-                    break
-            if found is None:
-                raise NotebookConflictError(
-                    f"{operation_name}: target cell {expected_cell_id!r} no "
-                    f"longer exists on the server — was it deleted by the user?"
-                )
-            if expected_source is not None:
-                src = found.get("source", "")
-                if isinstance(src, list):
-                    src = "".join(src)
-                if src != expected_source:
+        last_concurrent_err: ConcurrentWriteError | None = None
+        for _ in range(_MUTATE_RETRY_ATTEMPTS):
+            nb, last_modified = await self.read_notebook_with_meta()
+            if expected_cell_id is not None:
+                cells = nb.get("cells") or []
+                found = None
+                for c in cells:
+                    if c.get("id") == expected_cell_id:
+                        found = c
+                        break
+                if found is None:
                     raise NotebookConflictError(
-                        f"{operation_name}: target cell source changed since "
-                        f"the caller resolved the ref — retry after re-reading."
+                        f"{operation_name}: target cell {expected_cell_id!r} no "
+                        f"longer exists on the server — was it deleted by "
+                        f"another editor?"
                     )
-        mutated = mutator(nb)
-        out = mutated if mutated is not None else nb
-        await self.write_notebook(out)
-        return out
+                if expected_source is not None:
+                    src = found.get("source", "")
+                    if isinstance(src, list):
+                        src = "".join(src)
+                    if src != expected_source:
+                        raise NotebookConflictError(
+                            f"{operation_name}: target cell {expected_cell_id!r} "
+                            f"source changed since the caller resolved the ref "
+                            f"— another editor edited it. Re-read and retry."
+                        )
+            mutated = mutator(nb)
+            out = mutated if mutated is not None else nb
+            try:
+                await self.write_notebook(out, if_unmodified_since=last_modified)
+                return out
+            except ConcurrentWriteError as e:
+                # Someone else wrote between our read and our PUT. Re-read
+                # fresh and re-apply the mutator — semantic preconditions
+                # (cell_id / source) are re-checked on the next iteration's
+                # fresh state, so a delete-during-race still raises cleanly.
+                last_concurrent_err = e
+                continue
+        # Exhausted retries — surface the conflict so the caller knows.
+        assert last_concurrent_err is not None  # for type-checkers
+        raise last_concurrent_err
 
     async def patch_cell(
         self,
