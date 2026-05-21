@@ -77,6 +77,95 @@ def canonical_key(path: str) -> str:
     return Path(path).expanduser().resolve(strict=False).as_posix()
 
 
+def _norm_server_path(p: str) -> str:
+    """Strip leading slash for direct comparison with our ``server_relative``.
+
+    The Jupyter Server may or may not include the leading slash depending on
+    version and how the session was created. Comparing without normalizing
+    misses real matches and causes auto-rejoin to silently no-op.
+    """
+    return (p or "").lstrip("/")
+
+
+async def find_existing_session_for_path(
+    client: JupyterClient,
+    server_relative: str,
+    *,
+    exclude_session_id: str | None = None,
+) -> dict | None:
+    """Return a live Jupyter session whose path matches ``server_relative``,
+    using the same three-tier matching as ``maybe_rejoin``.
+
+    Tier order:
+
+    1. ``exact`` — server-side session path equals ``server_relative``.
+    2. ``vscode_synthetic`` — path matches VS Code's
+       ``<stem>-jvsc-<uuid>-<uuid>.ipynb`` encoding.
+    3. ``basename`` — same filename only, and only when uniquely matched
+       (to avoid silently cross-directory-hopping between notebooks that
+       happen to share a name).
+
+    Liveness is checked per candidate before selection. Returns ``None``
+    when no live candidate matches.
+
+    This is the same logic ``maybe_rejoin`` uses to follow the user's
+    kernel after the fact — applied at open time so Claude attaches to
+    VS Code's already-running kernel from the very first tool call,
+    instead of starting a parallel kernel and only converging on the
+    next tool call.
+    """
+    sessions = await client.list_sessions()
+    target = _norm_server_path(server_relative)
+    basename = Path(target).name
+    stem = Path(basename).stem
+
+    seen: set[str] = set()
+    exact: list[dict] = []
+    synthetic: list[dict] = []
+    basename_only: list[dict] = []
+    for s in sessions:
+        sid = s.get("id")
+        if not sid or sid in seen:
+            continue
+        seen.add(sid)
+        # Exclude our own session so it doesn't poison the tier lists
+        # (and gate basename fallback) when we're called from maybe_rejoin
+        # while already bound to a same-path session.
+        if exclude_session_id is not None and sid == exclude_session_id:
+            continue
+        spath = _norm_server_path(s.get("path") or "")
+        spath_name = Path(spath).name
+        if spath == target:
+            exact.append(s)
+        elif is_vscode_synthetic_path(spath_name, stem):
+            synthetic.append(s)
+        elif spath_name == basename:
+            basename_only.append(s)
+
+    async def _first_alive(lst: list[dict]) -> dict | None:
+        for s in lst:
+            try:
+                await client.get_kernel(s["kernel"]["id"])
+                return s
+            except Exception:
+                continue
+        return None
+
+    picked = await _first_alive(exact)
+    if picked is not None:
+        return picked
+    picked = await _first_alive(synthetic)
+    if picked is not None:
+        return picked
+    # Basename fallback only when no exact/synthetic candidates at all
+    # (even dead ones), and only when basename match is unique.
+    if exact or synthetic:
+        return None
+    if len(basename_only) != 1:
+        return None
+    return await _first_alive(basename_only)
+
+
 def resolve_cell_index(nb: dict, ref: int | str) -> int:
     cells = nb.get("cells") or []
     if isinstance(ref, int):
@@ -154,10 +243,22 @@ class NotebookSession:
         # already lives for this path. In that case the kernel pre-existed —
         # treat it as non-owned so close_notebook doesn't tear down a kernel
         # the user might be sharing with VS Code.
-        pre_existing = {s["id"] for s in await client.list_sessions()}
-        sess = await client.start_session_for_notebook(rel, kernel_name=kernel_name)
-        owns = sess["id"] not in pre_existing
-        return cls(
+        # Before spinning up our own kernel, look for one already running
+        # for this notebook — typically VS Code's, possibly under its
+        # synthetic ``<stem>-jvsc-…`` path. Attaching here means Claude
+        # shares the user's kernel from the very first tool call, instead
+        # of orphaning a parallel kernel until ``maybe_rejoin`` converges.
+        existing = await find_existing_session_for_path(client, rel)
+        if existing is not None:
+            sess = existing
+            owns = False
+        else:
+            pre_existing = {s["id"] for s in await client.list_sessions()}
+            sess = await client.start_session_for_notebook(
+                rel, kernel_name=kernel_name
+            )
+            owns = sess["id"] not in pre_existing
+        nb_session = cls(
             canonical=canonical,
             server_relative=rel,
             session_id=sess["id"],
@@ -223,23 +324,39 @@ class NotebookSession:
         2. ``vscode_synthetic`` — path matches ``<stem>-jvsc-<uuid>-<uuid>.ipynb``,
            the synthetic encoding VS Code's Jupyter extension uses.
         3. ``basename`` — same basename only. Used **only when exactly one**
-           live basename candidate exists, since multiple notebooks across the
-           tree can share a basename (``project_a/analysis.ipynb`` vs.
-           ``project_b/analysis.ipynb``) and hopping cross-directory would be
-           a silent footgun.
+           live basename candidate exists, since multiple notebooks across
+           the tree can share a basename (``project_a/analysis.ipynb`` vs.
+           ``project_b/analysis.ipynb``) and hopping cross-directory would
+           be a silent footgun.
 
-        Within a tier, prefer a kernel that isn't ours (that's the user's,
-        which is the point of co-editing). If our current binding is already
-        in the chosen tier and alive, stay. If the session is pinned (user
-        did an explicit ``rebind_kernel``), never switch.
+        Our own session is excluded from the tier lists so we don't gate
+        ourselves out of a synthetic/basename switch by also being at the
+        exact path. Pin (``rebind_kernel``) suppresses everything.
         """
         if self.pinned:
             return False
-        from pathlib import Path as _P
 
         sessions = await self.client.list_sessions()
-        basename = _P(self.server_relative).name
-        stem = _P(basename).stem
+
+        # Stickiness: if we're already bound to a session we didn't create
+        # ourselves (i.e. it's the user's), stay on it as long as it's still
+        # alive on the server. Without this, the *next* maybe_rejoin call
+        # after we attached to the user's kernel would see Claude's old
+        # also-alive session at the exact path and switch us back, bouncing
+        # us off the user's kernel on every other tool call.
+        if self.session_id not in self.owned_session_ids:
+            if any(s.get("id") == self.session_id for s in sessions):
+                try:
+                    await self.client.get_kernel(self.kernel_id)
+                    return False
+                except Exception:
+                    # Our user session's kernel died — fall through and try
+                    # to pick a new one.
+                    pass
+
+        target = _norm_server_path(self.server_relative)
+        basename = Path(target).name
+        stem = Path(basename).stem
 
         seen: set[str] = set()
         exact: list[dict] = []
@@ -250,9 +367,14 @@ class NotebookSession:
             if not sid or sid in seen:
                 continue
             seen.add(sid)
-            spath = s.get("path") or ""
-            spath_name = _P(spath).name
-            if spath == self.server_relative:
+            # Skip our own session so its presence at the exact path
+            # doesn't block fall-through to synthetic / basename tiers
+            # when VS Code uses a different path encoding for its session.
+            if sid == self.session_id:
+                continue
+            spath = _norm_server_path(s.get("path") or "")
+            spath_name = Path(spath).name
+            if spath == target:
                 exact.append(s)
             elif is_vscode_synthetic_path(spath_name, stem):
                 synthetic.append(s)
@@ -269,8 +391,7 @@ class NotebookSession:
                     pass
             return out
 
-        # Try tiers in order of preference using *alive* candidates only —
-        # a dead exact-path session must NOT block a live synthetic one.
+        # Try tiers in order of preference using *alive* candidates only.
         exact_alive = await _filter_alive(exact)
         if exact_alive:
             return self._switch_within_tier(exact_alive)
@@ -279,9 +400,10 @@ class NotebookSession:
         if synthetic_alive:
             return self._switch_within_tier(synthetic_alive)
 
-        # Basename fallback is the cross-directory danger zone. Only allow it
-        # when there are zero exact/synthetic candidates at all (even dead
-        # ones), and only when basename match is unique.
+        # Basename fallback is the cross-directory danger zone. Only allow
+        # it when no exact/synthetic candidates exist for *other* sessions
+        # (we already excluded our own above), and only when the basename
+        # match is unique.
         if exact or synthetic:
             return False
         basename_alive = await _filter_alive(basename_only)

@@ -163,6 +163,149 @@ async def test_auto_rejoin_to_user_kernel_via_vscode_synthetic_path(open_nb) -> 
     assert "y" in names and "x" not in names
 
 
+async def test_auto_rejoin_when_claude_already_at_exact_path(open_nb) -> None:
+    """The production scenario: Claude opens first (its session is at the
+    exact path), then VS Code creates a synthetic-path session for the
+    same notebook. The next kernel-touching tool call must switch Claude
+    to VS Code's kernel — our own exact-path presence shouldn't block the
+    synthetic-tier fallback.
+    """
+    session = await open_nb(["x = 'claude'"])
+    await execution.run_cell(session, 0, timeout_s=20)
+    kA = session.kernel_id
+
+    stem = Path(session.server_relative).stem
+    parent = Path(session.server_relative).parent.as_posix()
+    synthetic_path = f"{parent}/{stem}-jvsc-aaaa1111-bbbb2222.ipynb" if parent and parent != "." else f"{stem}-jvsc-aaaa1111-bbbb2222.ipynb"
+
+    # Upload the file at the synthetic path so the server accepts the session.
+    await session.client._http.put(
+        f"/api/contents/{synthetic_path}",
+        json={
+            "type": "notebook", "format": "json",
+            "content": {"cells": [], "metadata": {}, "nbformat": 4, "nbformat_minor": 5},
+        },
+    )
+    r = await session.client._http.post(
+        "/api/sessions",
+        json={
+            "kernel": {"name": "python3"},
+            "name": "vscode-mock",
+            "path": synthetic_path,
+            "type": "notebook",
+        },
+    )
+    r.raise_for_status()
+    sessB = r.json()
+    kB = sessB["kernel"]["id"]
+    assert kA != kB
+
+    # Plant a marker in B's kernel so we can verify the switch happened.
+    async with session.client.kernel_channel(kB, sessB["id"]) as ch:
+        mid = await ch.send(
+            "execute_request",
+            {
+                "code": "user_marker = 1",
+                "silent": False, "store_history": True,
+                "user_expressions": {}, "allow_stdin": False, "stop_on_error": True,
+            },
+        )
+        while True:
+            msg = await ch.recv(timeout=10.0)
+            if (msg.get("parent_header") or {}).get("msg_id") != mid:
+                continue
+            if (msg.get("msg_type") == "status"
+                and msg.get("content", {}).get("execution_state") == "idle"):
+                break
+
+    rejoined = await session.maybe_rejoin()
+    assert rejoined is True, "maybe_rejoin must switch to VS Code's kernel even when Claude is already at the exact path"
+    assert session.kernel_id == kB
+
+    names = {v["name"] for v in await inspection.list_variables(session)}
+    assert "user_marker" in names
+
+
+async def test_open_notebook_attaches_to_user_synthetic_session(tmp_path) -> None:
+    """If VS Code already has a session for this notebook under its
+    ``<stem>-jvsc-<uuid>-<uuid>.ipynb`` synthetic path, ``open_notebook``
+    must attach to it instead of starting a parallel kernel — otherwise
+    Claude and the user spend the first tool call on different kernels.
+    """
+    # Touch the file on disk so create_if_missing isn't needed.
+    path = tmp_path / "shared.ipynb"
+    path.write_text(
+        '{"cells": [], "metadata": {}, "nbformat": 4, "nbformat_minor": 5}'
+    )
+
+    # Boot the MCP's client (this also boots the supervised jupyter server),
+    # then pre-create a "VS Code" session under the synthetic path with a
+    # python3 kernel — exactly what the VS Code Jupyter extension does.
+    client = await registry.get_client()
+    server_rel = str(path).lstrip("/")
+    stem = path.stem
+    vsc_synth_path = f"{path.parent.as_posix().lstrip('/')}/{stem}-jvsc-aaaa1111-bbbb2222.ipynb"
+
+    # Upload the file at the synthetic path too so the server accepts the session.
+    await client._http.put(
+        f"/api/contents/{vsc_synth_path}",
+        json={
+            "type": "notebook",
+            "format": "json",
+            "content": {"cells": [], "metadata": {}, "nbformat": 4, "nbformat_minor": 5},
+        },
+    )
+    r = await client._http.post(
+        "/api/sessions",
+        json={
+            "kernel": {"name": "python3"},
+            "name": "vscode-mock",
+            "path": vsc_synth_path,
+            "type": "notebook",
+        },
+    )
+    r.raise_for_status()
+    sessB = r.json()
+    kB = sessB["kernel"]["id"]
+
+    # Plant a variable in the user's kernel so we can verify Claude actually
+    # attached (rather than starting its own kernel that happens to be alive).
+    async with client.kernel_channel(kB, sessB["id"]) as ch:
+        mid = await ch.send(
+            "execute_request",
+            {
+                "code": "user_marker = 'from_vscode'",
+                "silent": False, "store_history": True,
+                "user_expressions": {}, "allow_stdin": False, "stop_on_error": True,
+            },
+        )
+        while True:
+            msg = await ch.recv(timeout=10.0)
+            if (msg.get("parent_header") or {}).get("msg_id") != mid:
+                continue
+            if (msg.get("msg_type") == "status"
+                and msg.get("content", {}).get("execution_state") == "idle"):
+                break
+
+    # Now Claude opens the notebook. Without the open-time matcher this
+    # would spawn a new kernel without ``user_marker``; with it, we attach
+    # to kB and inherit the user's namespace.
+    session = await registry.open_session(str(path), create_if_missing=False)
+
+    assert session.kernel_id == kB, (
+        f"open_notebook should reuse VS Code's synthetic-path kernel "
+        f"({kB}), got {session.kernel_id}"
+    )
+    # And the session must NOT be marked as owned, so close_notebook never
+    # tears down the user's kernel.
+    assert sessB["id"] not in session.owned_session_ids
+
+    names = {v["name"] for v in await inspection.list_variables(session)}
+    assert "user_marker" in names, (
+        "Claude should see the user's variable from the very first call"
+    )
+
+
 async def test_rebind_kernel_sticks_across_operations(open_nb) -> None:
     """After explicit rebind_kernel, the next operation must NOT auto-rejoin
     back to the original kernel. (Regression for the snap-back bug.)
