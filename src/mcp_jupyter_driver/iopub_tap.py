@@ -186,30 +186,53 @@ class IopubTap:
                     kid, tap_session_id
                 ) as ch:
                     backoff = _RECONNECT_BACKOFF_INITIAL_S
-                    while not self._stop.is_set():
-                        # Reconnect if the session's kernel binding moved
-                        # under us (auto-rejoin, rebind, restart).
-                        if self._session.kernel_id != kid:
-                            break
-                        try:
-                            msg = await ch.recv(timeout=0.5)
-                        except asyncio.TimeoutError:
-                            continue
-                        try:
-                            self._handle(msg)
-                        except Exception:
-                            # One malformed message must not kill the tap.
-                            continue
+                    try:
+                        while not self._stop.is_set():
+                            # Reconnect if the session's kernel binding moved
+                            # under us (auto-rejoin, rebind, restart).
+                            if self._session.kernel_id != kid:
+                                break
+                            try:
+                                msg = await ch.recv(timeout=0.5)
+                            except asyncio.TimeoutError:
+                                continue
+                            try:
+                                self._handle(msg)
+                            except Exception:
+                                # One malformed message must not kill the tap.
+                                continue
+                    finally:
+                        # If we're leaving this kernel (rebind/restart/error)
+                        # any still-pending in-flight executions will never
+                        # receive their ``status: idle`` — finalize them now
+                        # so they don't leak forever in ``_in_flight``.
+                        self._finalize_in_flight(reason="disconnected")
             except asyncio.CancelledError:
                 raise
             except Exception:
                 # Connection error, kernel restart, etc. Back off and retry.
+                self._finalize_in_flight(reason="disconnected")
                 try:
                     await asyncio.wait_for(self._stop.wait(), timeout=backoff)
                     return
                 except asyncio.TimeoutError:
                     pass
                 backoff = min(backoff * 2, _RECONNECT_BACKOFF_MAX_S)
+
+    def _finalize_in_flight(self, *, reason: str) -> None:
+        """Move all currently in-flight executions into the ring buffer with
+        a synthetic finish time. Used when the iopub connection drops and we
+        know we will never see the matching ``status: idle`` for those
+        executions."""
+        if not self._in_flight:
+            return
+        now = time.time()
+        for ex in list(self._in_flight.values()):
+            if ex.status == "in_progress":
+                ex.status = reason
+            ex.finished_at = now
+            self._buffer.append(ex)
+        self._in_flight.clear()
 
     def _handle(self, msg: dict) -> None:
         if msg.get("channel") != "iopub":

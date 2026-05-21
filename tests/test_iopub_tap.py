@@ -158,3 +158,28 @@ async def test_stop_when_never_started_is_no_op() -> None:
     session = _make_session()
     tap = IopubTap(session)
     await tap.stop()  # should not raise
+
+
+def test_finalize_in_flight_moves_pending_executions_to_buffer() -> None:
+    """If the iopub socket drops mid-execution (kernel restart, rebind),
+    pending entries in ``_in_flight`` would otherwise never receive a
+    ``status: idle`` and leak forever. ``_finalize_in_flight`` must move
+    them to the buffer with a synthetic finish time and a distinguishable
+    status so callers see them as completed-but-interrupted."""
+    session = _make_session()
+    tap = IopubTap(session)
+
+    tap._handle(_iopub("execute_input", "m-in-flight", session.session_id, {"code": "stuck"}))
+    # No idle arrives — simulate a dropped connection.
+    assert len(tap.recent_executions()) == 1  # in-flight visible
+    assert tap._in_flight  # still pending
+
+    tap._finalize_in_flight(reason="disconnected")
+
+    assert not tap._in_flight, "in-flight must be drained"
+    execs = tap.recent_executions(include_in_flight=False)
+    assert len(execs) == 1
+    ex = execs[0]
+    assert ex.status == "disconnected"
+    assert ex.finished_at is not None
+    assert ex.code == "stuck"

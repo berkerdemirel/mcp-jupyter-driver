@@ -195,7 +195,9 @@ class JupyterServer:
                 await proc.wait()
         if self._stderr_task is not None:
             self._stderr_task.cancel()
-            with contextlib.suppress(Exception):
+            # CancelledError is BaseException (not Exception) since 3.8, so
+            # ``suppress(Exception)`` would let it escape and abort ``stop``.
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._stderr_task
             self._stderr_task = None
         # Note: we deliberately leave CONNECTION_CACHE_PATH and
