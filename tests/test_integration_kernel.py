@@ -257,6 +257,65 @@ async def test_restart_kernel_clears_pin(open_nb) -> None:
     assert session.pinned is False
 
 
+async def test_iopub_tap_captures_user_side_execution(open_nb) -> None:
+    """When the user runs a cell from VS Code's side, the iopub tap should
+    record the execution and tag it ``by_claude=False`` so Claude can pick
+    up the user's activity without polling.
+    """
+    import asyncio
+
+    session = await open_nb(["x = 'claude'"])
+    # First Claude-side run so we have at least one ``by_claude=True``
+    # execution to compare against.
+    await execution.run_cell(session, 0, timeout_s=20)
+
+    # Give the long-lived iopub tap a moment to settle on the kernel.
+    assert session.iopub_tap is not None, "tap should be auto-started on open"
+    await asyncio.sleep(0.5)
+
+    # Simulate VS Code by sending execute_request on Claude's kernel but
+    # with a different message-protocol session id in the header. The
+    # Jupyter kernel echoes ``session`` in parent_header, which is the
+    # signal the tap uses to attribute the run. Posting a new HTTP session
+    # for the same path is no good — jupyter-server deduplicates by path
+    # and would hand back Claude's existing session id.
+    user_session_id = "vscode-mock-session-deadbeef"
+    assert user_session_id != session.session_id
+
+    async with session.client.kernel_channel(session.kernel_id, user_session_id) as ch:
+        mid = await ch.send(
+            "execute_request",
+            {
+                "code": "user_var = 'from_vscode'",
+                "silent": False,
+                "store_history": True,
+                "user_expressions": {},
+                "allow_stdin": False,
+                "stop_on_error": True,
+            },
+        )
+        # Drive the side channel until idle so the iopub broadcast has flushed.
+        while True:
+            msg = await ch.recv(timeout=10.0)
+            if (msg.get("parent_header") or {}).get("msg_id") != mid:
+                continue
+            if (
+                msg.get("msg_type") == "status"
+                and msg.get("content", {}).get("execution_state") == "idle"
+            ):
+                break
+
+    # The tap runs in the background; give it a beat to catch up.
+    await asyncio.sleep(0.3)
+
+    execs = session.iopub_tap.recent_executions()
+    user_runs = [e for e in execs if not e.by_claude]
+    assert any(
+        (e.code or "").strip().startswith("user_var = 'from_vscode'")
+        for e in user_runs
+    ), f"expected to find user_var run in tap. got: {[(e.code, e.by_claude) for e in execs]}"
+
+
 async def test_auto_rejoin_to_user_kernel_via_basename(open_nb) -> None:
     """If a session for the same notebook exists under a different path
     encoding (basename match), Claude should auto-rejoin its kernel on the

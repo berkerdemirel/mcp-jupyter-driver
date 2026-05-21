@@ -298,6 +298,37 @@ async def test_run_code_keeps_temp_cell_when_kernel_still_running(monkeypatch) -
 
 
 @pytest.mark.asyncio
+async def test_recent_user_activity_reports_cell_changes_since_first_call() -> None:
+    """First call seeds the snapshot (no changes reported). Then the user
+    inserts and edits cells; a second call surfaces the diff. The iopub
+    tap is unavailable here (stub client has no kernel_channel) so
+    executions stay empty and the response carries a note explaining why.
+    """
+    session, client, path = _seed([_code_cell("a", "x = 1")])
+    # Mark the tap as absent so collect_user_activity hits the "no signal"
+    # branch — the stub client doesn't implement kernel_channel.
+    session.iopub_tap = None
+
+    first = await server.recent_user_activity(path)
+    assert first.cell_changes == []
+    assert "iopub tap unavailable" in first.note
+
+    # User inserts a new cell and edits the original from VS Code.
+    client.notebook["cells"].append(_code_cell("b", "y = 2"))
+    client.notebook["cells"][0]["source"] = "x = 99"
+
+    second = await server.recent_user_activity(path)
+    kinds = {(c.kind, c.cell_id) for c in second.cell_changes}
+    assert ("added", "b") in kinds
+    assert ("edited", "a") in kinds
+
+    # A third immediate call sees no further changes — the second call
+    # advanced the last-seen snapshot.
+    third = await server.recent_user_activity(path)
+    assert third.cell_changes == []
+
+
+@pytest.mark.asyncio
 async def test_run_code_keeps_temp_cell_when_run_raises(monkeypatch) -> None:
     """If the execution path raises (kernel died, websocket error, ...),
     the finally block should still attempt cleanup but skip the delete —

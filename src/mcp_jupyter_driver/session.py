@@ -119,6 +119,21 @@ class NotebookSession:
         self.owned_session_ids: set[str] = (
             {session_id} if owns_session else set()
         )
+        # Every session_id the binding has ever pointed at. The iopub tap
+        # uses this to attribute executions: anything whose parent_session
+        # is in this set is "Claude's"; everything else is "the user's."
+        # Updated by maybe_rejoin / rebind_to_kernel when the binding moves.
+        self.historical_session_ids: set[str] = {session_id}
+        # Persistent iopub subscriber (see iopub_tap.py). Started by
+        # ``open`` once we have a running event loop; stopped by ``close``.
+        # ``None`` if the tap couldn't start (e.g. test stubs that don't
+        # implement kernel_channel) — callers must tolerate that.
+        from .iopub_tap import IopubTap  # late import to avoid cycle
+
+        self.iopub_tap: IopubTap | None = IopubTap(self)
+        # Last-seen notebook snapshot for awareness diffing. Populated
+        # lazily by callers (e.g. on each tool entry) — see awareness.py.
+        self.last_seen_notebook: dict | None = None
 
     @classmethod
     async def open(
@@ -151,6 +166,15 @@ class NotebookSession:
             client=client,
             owns_session=owns,
         )
+        # Spin up the iopub tap so awareness is live from the first tool
+        # call onward. Failures (e.g. test stubs without kernel_channel)
+        # are non-fatal — drop the tap to None and continue.
+        try:
+            if nb_session.iopub_tap is not None:
+                nb_session.iopub_tap.start()
+        except Exception:
+            nb_session.iopub_tap = None
+        return nb_session
 
     async def close(self, *, shutdown_kernel: bool = True) -> None:
         """End this notebook binding.
@@ -160,6 +184,14 @@ class NotebookSession:
         owns, we leave that session alone — closing a notebook should never
         kill someone else's kernel.
         """
+        # Always stop the iopub tap; it holds an open WebSocket and a
+        # background task that would otherwise leak after close.
+        if self.iopub_tap is not None:
+            try:
+                await self.iopub_tap.stop()
+            except Exception:
+                pass
+            self.iopub_tap = None
         if not shutdown_kernel:
             return
         for sid in list(self.owned_session_ids):
@@ -272,6 +304,10 @@ class NotebookSession:
         self.session_id = pick["id"]
         self.kernel_id = pick["kernel"]["id"]
         self.kernel_name = pick["kernel"]["name"]
+        # Track the new session_id so the iopub tap's "Claude vs user"
+        # attribution doesn't suddenly misclassify our own runs as the
+        # user's after a rejoin.
+        self.historical_session_ids.add(pick["id"])
         return True
 
     # Minimum length for a kernel_id prefix to be accepted by rebind_to_kernel.
@@ -350,6 +386,7 @@ class NotebookSession:
         self.kernel_id = pick["kernel"]["id"]
         self.kernel_name = pick["kernel"]["name"]
         self.pinned = True
+        self.historical_session_ids.add(pick["id"])
         return RebindOutcome(
             ok=True,
             new_session_id=pick["id"],

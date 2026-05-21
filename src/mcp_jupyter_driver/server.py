@@ -15,7 +15,8 @@ import nbformat
 from mcp.server.fastmcp import Context, FastMCP
 from pydantic import BaseModel, Field
 
-from . import execution, inspection, registry
+from . import awareness, execution, inspection, registry
+from .awareness import UserActivity
 from .errors import CellNotFoundError, NotebookConflictError
 from .jserver import get_or_start_server, stop_server
 from .session import NotebookSession, resolve_cell_index
@@ -747,6 +748,41 @@ async def complete(path: str, source: str, cursor_pos: int) -> CompletionResult:
     """Kernel-driven completion."""
     session = registry.get_session(path)
     return CompletionResult(**(await inspection.complete(session, source, cursor_pos)))
+
+
+# ----- awareness -------------------------------------------------------------
+
+
+@mcp.tool()
+async def recent_user_activity(
+    path: str,
+    since: float | None = None,
+    include_claude: bool = False,
+) -> UserActivity:
+    """Report what's happened on this notebook since you last looked.
+
+    Two signals are merged:
+
+    - **Cell-level changes** (added / removed / edited / moved) between the
+      MCP's last-seen snapshot of the notebook and the latest server state.
+      Catches anything the user did in VS Code: inserting a cell, editing a
+      source, deleting one, reordering. Output-only changes are NOT here —
+      they show up via the executions list below.
+    - **Recent kernel executions** captured by the iopub tap. Each one is
+      tagged ``by_claude=True`` (you ran it) or ``by_claude=False`` (the
+      user, or another client, ran it). Default is to return only the
+      non-Claude ones; pass ``include_claude=True`` to see yours too.
+
+    The first call against a freshly-opened notebook returns no cell
+    changes (it just establishes the snapshot). Subsequent calls report
+    deltas since the previous call. ``since`` (epoch seconds) only filters
+    executions — cell-level deltas are always against the last-seen
+    snapshot stored on the session.
+    """
+    session = registry.get_session(path)
+    return await awareness.collect_user_activity(
+        session, since=since, include_claude=include_claude
+    )
 
 
 # ----- kernel control --------------------------------------------------------
