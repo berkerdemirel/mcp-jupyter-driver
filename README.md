@@ -10,32 +10,32 @@ from the notebook file.
 
 Cell outputs and structural edits Claude makes go through the Jupyter
 Server's Contents API and are written to disk. VS Code's notebook editor
-auto-reloads from disk **only when its in-memory copy isn't dirty**.
-The dirty/clean rule, precisely:
+auto-reloads from disk **whenever its in-memory copy isn't dirty** — so
+in practice, just save your work (`Ctrl/Cmd+S`) after running cells or
+typing in a cell, and Claude's subsequent writes appear automatically.
 
-| Your state in VS Code | What you see when Claude writes |
-|---|---|
-| Notebook open, no cell run from VS Code, no source typed | Claude's edits appear automatically — VS Code reloads on file change. |
-| You ran any cell from VS Code (output added → dirty) | VS Code keeps its in-memory copy. Claude's writes sit in the file unseen. |
-| You typed in a cell (unsaved source edit) | Same as above — VS Code won't clobber your unsaved work. |
+The only state where reload pauses is "your in-memory copy has unsaved
+changes" — VS Code rightly won't clobber unsaved work. Save (or undo)
+and the next external write from Claude appears.
 
-To make Claude's edits live in either state, install the **companion VS
-Code extension** in `vscode-extension/`. It watches `.ipynb` files; on
-external change it auto-reverts clean notebooks and surfaces a status-bar
-nudge ("Claude updated `<name>` — click to reload") for dirty ones. It's
-plain JavaScript with no build step — symlink the folder into
-`~/.vscode/extensions/` and restart VS Code. See
+For users who don't want to remember to save, the **companion VS Code
+extension** in `vscode-extension/` watches `.ipynb` files and, on
+external change, reverts clean notebooks automatically or surfaces a
+status-bar nudge ("Claude updated `<name>` — click to reload") when
+your copy is dirty. It's plain JavaScript with no build step — symlink
+the folder into `~/.vscode/extensions/` and restart VS Code. See
 [`vscode-extension/README.md`](vscode-extension/README.md) for details.
 
-(Variable sharing through the kernel works regardless — that's the more
-fundamental property of the shared-server architecture, below. Use
-`list_variables` / `inspect_variable` to see what's in the kernel without
-needing the notebook UI in sync.)
+(Variable sharing through the kernel works regardless of the notebook
+view — that's the more fundamental property of the shared-server
+architecture, below. Use `list_variables` / `inspect_variable` to see
+what's in the kernel without needing the notebook UI in sync.)
 
-`jupyter-collaboration` would give true live sync via Y.js, but at
-present its WebSocket flow conflicts with VS Code's Jupyter extension's
-cell execution path, leaving cells stuck. The companion extension above
-gets us most of the way there without the Yjs dependency.
+`jupyter-collaboration` would give true CRDT-based live sync via Y.js,
+but at present its WebSocket flow conflicts with VS Code's Jupyter
+extension's cell execution path, leaving cells stuck. The save-then-
+reload behavior plus the optional companion extension cover the same
+ground without the Yjs dependency.
 
 ## Claude sees what you do (live awareness)
 
@@ -122,44 +122,56 @@ Restart Claude Code. `/mcp` should list `jupyter` with all tools.
 
 ## Use your real Python environment for the kernel
 
-By default the kernel runs in the `python3` kernelspec, which is the MCP's
-own uv-managed venv (minimal packages). To run your data-science stack
-(pandas, torch, sklearn, etc.) install `ipykernel` in *your* env and register
-it once:
+The kernel choice is owned by VS Code in the recommended workflow:
+register your environment as a kernelspec once, pick it in VS Code's
+kernel picker, and Claude inherits it via `find_existing_session_for_path`
+on the next `open_notebook` call.
 
 ```bash
-# from inside your conda/uv/venv environment
+# from inside your conda/uv/venv environment, one time
 pip install ipykernel
 python -m ipykernel install --user --name myenv --display-name "myenv"
 ```
 
-Then when opening a notebook from Claude, pass `kernel_name="myenv"`:
+Then in VS Code: open the notebook → kernel picker (top right) → pick
+`myenv` under the running server. Now ask Claude to open the same
+notebook — Claude attaches to that kernel automatically. `list_kernelspecs`
+lists what's registered if you want to confirm.
 
-> "Open `/path/to/work.ipynb` with kernel `myenv`."
+If you instead open the notebook from Claude *first* (Flow A — no VS
+Code session exists yet), pass `kernel_name="myenv"` on `open_notebook`
+to make Claude start `myenv` itself; auto-rejoin will still converge
+once you connect VS Code.
 
-List available kernels via the `list_kernelspecs` tool.
+## Connect VS Code to the supervised Jupyter Server (one-time setup)
 
-## Connect VS Code to the same server (one-time setup)
+The Jupyter Server here is shared — neither "Claude's" nor "VS Code's".
+The MCP supervises it as a subprocess; Claude and your editor are both
+clients of it via standard Jupyter REST + WebSocket. Bootstrapping
+happens via Claude because the MCP starts the server on first tool
+call, but once it's running both sides connect on equal footing.
 
-1. Start a Claude Code session with this MCP enabled.
+1. Launch Claude Code with this MCP enabled. The MCP starts the
+   supervised Jupyter Server on first tool call.
 2. Ask Claude to call `jupyter_server_info`. It returns `url_with_token`,
    a single string of the form `http://127.0.0.1:<port>/?token=<token>`.
 3. In VS Code, open the `.ipynb` you want to work on (notebook view).
 4. Top right, click the kernel picker → **"Select Another Kernel..."** →
    **"Existing Jupyter Server..."** → paste `url_with_token` into the URL
-   box (one string — the token is embedded as a query parameter, which is
-   what VS Code expects). Give the server any nickname.
-5. After it connects, you'll see kernels listed. Pick the one Claude is
-   using (or pick any — VS Code will route the notebook to a kernel from
-   this server, and `open_notebook` from Claude will reuse the same session
-   if you pass the same path).
+   box (one string — the token is embedded as a query parameter, which
+   is what VS Code expects). Give the server any nickname.
+5. After it connects, pick the kernel you want from the picker
+   (your registered `myenv`, or any other kernelspec on this server).
+   The next time you ask Claude to `open_notebook` on this path, Claude
+   attaches to the session you just created — same kernel, shared
+   variables.
 
 If VS Code warns about an insecure server, that means the URL is missing
 the `?token=...` suffix. Make sure you pasted `url_with_token`, not just
 `url`.
 
-After this, runs you trigger from VS Code's UI and runs Claude triggers via
-the MCP both hit the same kernel. Variables flow between you.
+After this, runs you trigger from VS Code's UI and runs Claude triggers
+via the MCP both hit the same kernel. Variables flow between you.
 
 The URL+token are also written to `~/.cache/mcp-jupyter-driver/connection.json`
 for convenience.
@@ -290,38 +302,42 @@ Claude attaches to your kernel from the very first call.
    - Delete a cell in VS Code. Variables it created stay alive. Claude can
      still use them.
 
-## Conflict protection for concurrent edits
+## Concurrent edits work — both sides land
 
-Before every structural notebook mutation (`add_cell`, `edit_cell`,
-`delete_cell`, `move_cell`, `clear_cell_outputs`, `run_code`'s temp-cell
-path, `restart_kernel(clear_outputs=True)`, and the widget metadata
-install), the MCP re-reads the notebook from the Jupyter Server and applies
-the edit on the freshest server-side state. Targets are located by stable
-`cell.id`, not by index — so a concurrent VS Code reorder can't make Claude
-edit the wrong cell, and a concurrent delete produces a clear
-`NotebookConflictError` instead of writing.
+In practice you and Claude can edit the same notebook freely. The
+layered safeguards make races a non-issue:
 
-The fresh re-read also captures the server's `last_modified` and passes
-it to the PUT as an optimistic precondition. If another writer saves the
-file in the small window between our read and our PUT, we raise
-`ConcurrentWriteError` (a `NotebookConflictError` subclass) — and
-`mutate_notebook_fresh` retries up to three times by re-reading and
-re-applying the mutator, so transient races during streaming output
-flushes don't surface to Claude. Persistent races (e.g. a tight save
-loop) eventually do surface.
+- **Sync before mutate.** Every structural notebook mutation
+  (`add_cell`, `edit_cell`, `delete_cell`, `move_cell`,
+  `clear_cell_outputs`, `run_code`'s temp-cell path,
+  `restart_kernel(clear_outputs=True)`, and the widget metadata
+  install) re-reads the notebook from the Jupyter Server immediately
+  before writing, and applies the edit on the freshest server-side
+  state.
+- **Cell-id targeting.** Mutations locate the target by stable
+  `cell.id`, not by index — so a reorder you did in VS Code can't
+  make Claude edit the wrong cell, and a delete produces a clean
+  `NotebookConflictError` rather than mis-editing.
+- **Optimistic mtime precondition + bounded retry.** The fresh re-read
+  captures the server's `last_modified`; the PUT carries it as an
+  `If-Unmodified-Since`-style check. If you saved in the tiny window
+  between Claude's read and PUT, `mutate_notebook_fresh` re-reads and
+  re-applies the mutator (up to three attempts) instead of surfacing
+  a race. Persistent contention eventually raises
+  `ConcurrentWriteError`, but you won't hit that under normal use.
 
-In practice this means:
+Concretely:
 
-- If you edit cell A in VS Code while Claude edits cell B, both edits land.
-- If you delete a cell that Claude is about to edit, Claude's call fails
-  with a `NotebookConflictError` ("target cell no longer exists") instead
-  of accidentally editing whatever cell ended up at that index.
-- If you save the notebook from VS Code at the exact moment Claude is
-  flushing outputs, Claude's mutation retries against the new state
-  instead of clobbering you.
-- `clear_cell_outputs` (all-cells mode) and `restart_kernel(clear_outputs=True)`
-  only zero `outputs` / `execution_count` on the freshest cells, so source
-  edits you made in VS Code are preserved.
+- Edit cell A in VS Code while Claude edits cell B — both edits land.
+- Delete a cell Claude is about to edit — Claude's call fails clearly
+  ("target cell no longer exists") instead of editing the wrong cell.
+- Save the notebook while Claude is flushing streaming outputs —
+  Claude's mutation retries against your new state rather than
+  clobbering you.
+- `clear_cell_outputs` (all-cells mode) and
+  `restart_kernel(clear_outputs=True)` only zero `outputs` /
+  `execution_count` on the freshest cells, so source edits you made
+  in VS Code are preserved.
 
 ## Failure-mode behavior
 
@@ -338,8 +354,10 @@ In practice this means:
 
 ```bash
 uv sync
-uv run pytest          # helpers + server-backed integration tests
-uv run pytest tests/test_execution_helpers.py tests/test_session_helpers.py tests/test_widgets.py
+uv run pytest          # all tests (helpers + Jupyter-Server-backed integration)
+uv run pytest tests/test_execution_helpers.py tests/test_session_helpers.py \
+              tests/test_widgets.py tests/test_iopub_tap.py \
+              tests/test_awareness.py tests/test_conflict_tools.py
                        # kernel-free unit tests only — fast, no jupyter server required
 uv run python -m mcp_jupyter_driver --self-check
 ```
