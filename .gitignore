@@ -27,3 +27,6 @@ wheels/
 
 # MCP runtime
 .cache/
+
+# Scratch / review notes (not part of the project)
+gpt_feedback*.md

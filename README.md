@@ -10,19 +10,55 @@ from the notebook file.
 
 Cell outputs and structural edits Claude makes go through the Jupyter
 Server's Contents API and are written to disk. VS Code's notebook editor
-holds its own in-memory copy and does **not** auto-reload on external file
-changes — so to *see* Claude's updates, run **"File: Revert File"** (or
-"Notebook: Revert") from the command palette.
+auto-reloads from disk **only when its in-memory copy isn't dirty**.
+The dirty/clean rule, precisely:
+
+| Your state in VS Code | What you see when Claude writes |
+|---|---|
+| Notebook open, no cell run from VS Code, no source typed | Claude's edits appear automatically — VS Code reloads on file change. |
+| You ran any cell from VS Code (output added → dirty) | VS Code keeps its in-memory copy. Claude's writes sit in the file unseen. |
+| You typed in a cell (unsaved source edit) | Same as above — VS Code won't clobber your unsaved work. |
+
+To make Claude's edits live in either state, install the **companion VS
+Code extension** in `vscode-extension/`. It watches `.ipynb` files; on
+external change it auto-reverts clean notebooks and surfaces a status-bar
+nudge ("Claude updated `<name>` — click to reload") for dirty ones. It's
+plain JavaScript with no build step — symlink the folder into
+`~/.vscode/extensions/` and restart VS Code. See
+[`vscode-extension/README.md`](vscode-extension/README.md) for details.
 
 (Variable sharing through the kernel works regardless — that's the more
 fundamental property of the shared-server architecture, below. Use
 `list_variables` / `inspect_variable` to see what's in the kernel without
 needing the notebook UI in sync.)
 
-`jupyter-collaboration` would give true live sync via Y.js, but at present
-its WebSocket flow conflicts with VS Code's Jupyter extension's cell
-execution path, leaving cells stuck. We may revisit when VS Code's
-collaboration support matures.
+`jupyter-collaboration` would give true live sync via Y.js, but at
+present its WebSocket flow conflicts with VS Code's Jupyter extension's
+cell execution path, leaving cells stuck. The companion extension above
+gets us most of the way there without the Yjs dependency.
+
+## Claude sees what you do (live awareness)
+
+The MCP keeps a long-lived **iopub subscriber** on each notebook's shared
+kernel — read-only, so it doesn't interfere with anyone's runs — and a
+running snapshot of the notebook structure. When you run a cell from VS
+Code or edit/delete/move cells, Claude can ask for a summary:
+
+```
+recent_user_activity(path) → UserActivity {
+  cell_changes: [added | removed | edited | moved …],
+  executions:   [{ code, outputs_preview, by_claude=False, … }, …],
+  …
+}
+```
+
+The execution log is attributed via the originating Jupyter session id —
+runs Claude triggered show `by_claude=True`, runs you triggered show
+`by_claude=False`. By default the tool only returns your runs (pass
+`include_claude=True` to also see Claude's). This is the channel for "I
+want to check things in the notebook without prompting Claude, but I
+want Claude to be aware of what I checked." Claude can poll this between
+prompts to stay synced.
 
 ## How it works
 
@@ -189,6 +225,12 @@ Override via env vars if you need to:
 | `inspect_variable(path, name, max_repr_len=2000)` | Deep inspect (pandas: columns/dtypes/head; numpy: shape/dtype). |
 | `complete(path, source, cursor_pos)` | Kernel-driven completion. |
 
+**Awareness** (push-style: what the user has been doing)
+
+| Tool | What it does |
+|---|---|
+| `recent_user_activity(path, since=None, include_claude=False)` | Iopub-tap'd executions plus cell-level diff since the last call. Use this between prompts so Claude picks up what you did in VS Code without you having to narrate it. |
+
 **Kernel control**
 
 | Tool | What it does |
@@ -204,22 +246,41 @@ Override via env vars if you need to:
 | `list_jupyter_sessions(path=None)` | All sessions/kernels on the local server. `is_claudes` flags the one Claude is bound to. Use this when you suspect you and Claude are on different kernels. |
 | `rebind_kernel(path, target)` | Point Claude's notebook session at a specific kernel. `target` can be a kernel_id, session_id, or kernel_id prefix (8 chars). |
 
-Claude also **auto-rejoins** your kernel before each `run_cell` / `list_variables` /
-etc. if it detects a live session for the same notebook (matched by exact
-path or by basename, since VS Code and Jupyter Server sometimes disagree on
-path encoding).
+Claude **attaches to your kernel automatically** in two places:
 
-## A typical workflow
+- **At `open_notebook` time**, `find_existing_session_for_path` looks for a
+  live session for this notebook using three tiers — exact path, VS Code's
+  synthetic `<stem>-jvsc-<uuid>-<uuid>.ipynb`, and unique-basename fallback
+  — and attaches with `owns_session=False` (so `close_notebook` never
+  shuts your kernel down).
+- **Before every kernel-touching tool** (`run_cell`, `list_variables`,
+  `kernel_status`, etc.), `maybe_rejoin` re-checks the same tiers and
+  switches if a better match exists. Once attached to a user-owned
+  session, the binding is **sticky** — subsequent `maybe_rejoin` calls
+  won't bounce back to Claude's original throwaway kernel even though
+  it's still alive at the exact path.
 
-1. In VS Code: open your notebook in notebook view.
-2. In a Claude Code session (with this MCP active), ask:
+Path matching normalizes leading slashes on both sides, and Claude's own
+session is excluded from the tier lists so it can't gate the fallbacks.
+
+## A typical workflow (VS Code-first, recommended)
+
+This order avoids any transient "we're on different kernels" mismatch —
+Claude attaches to your kernel from the very first call.
+
+1. In Claude Code (with this MCP active), ask:
    > Get the Jupyter server info.
-   Claude calls `jupyter_server_info` and tells you the URL+token.
-3. In VS Code: connect to "Existing Jupyter Server" with that URL+token. Pick
-   a kernel (or your registered `myenv`).
-4. From Claude, open the same notebook:
-   > Open `/path/to/work.ipynb` with kernel `myenv`.
-5. Drive it together. Examples:
+   Claude calls `jupyter_server_info` and tells you the URL+token. **Don't
+   open the notebook from Claude yet.**
+2. In VS Code: connect to "Existing Jupyter Server" with the URL+token
+   (saved across MCP restarts, so this is one-time setup). Open your
+   notebook in notebook view, pick a kernel.
+3. *Now* from Claude, open the same notebook:
+   > Open `/path/to/work.ipynb`.
+
+   `find_existing_session_for_path` lands on VS Code's session
+   immediately — same kernel, same PID, shared variables.
+4. Drive it together. Examples:
    - You add a cell that loads an image, run it from VS Code.
    - Ask Claude: *"Add a cell that shows the histogram of that image."* —
      Claude reads the live notebook, adds a cell, runs it against the same
@@ -240,12 +301,24 @@ the edit on the freshest server-side state. Targets are located by stable
 edit the wrong cell, and a concurrent delete produces a clear
 `NotebookConflictError` instead of writing.
 
+The fresh re-read also captures the server's `last_modified` and passes
+it to the PUT as an optimistic precondition. If another writer saves the
+file in the small window between our read and our PUT, we raise
+`ConcurrentWriteError` (a `NotebookConflictError` subclass) — and
+`mutate_notebook_fresh` retries up to three times by re-reading and
+re-applying the mutator, so transient races during streaming output
+flushes don't surface to Claude. Persistent races (e.g. a tight save
+loop) eventually do surface.
+
 In practice this means:
 
 - If you edit cell A in VS Code while Claude edits cell B, both edits land.
 - If you delete a cell that Claude is about to edit, Claude's call fails
   with a `NotebookConflictError` ("target cell no longer exists") instead
   of accidentally editing whatever cell ended up at that index.
+- If you save the notebook from VS Code at the exact moment Claude is
+  flushing outputs, Claude's mutation retries against the new state
+  instead of clobbering you.
 - `clear_cell_outputs` (all-cells mode) and `restart_kernel(clear_outputs=True)`
   only zero `outputs` / `execution_count` on the freshest cells, so source
   edits you made in VS Code are preserved.
