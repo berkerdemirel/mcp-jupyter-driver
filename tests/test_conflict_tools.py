@@ -133,6 +133,38 @@ async def test_edit_cell_preserves_concurrent_user_edit_to_different_cell() -> N
 
 
 @pytest.mark.asyncio
+async def test_edit_cell_raises_when_user_edited_same_cell_concurrently() -> None:
+    """Claude resolves edit_cell(b), and the user edits the SAME cell b in
+    VS Code before the mutator runs. Must raise ``NotebookConflictError``
+    instead of silently overwriting the user's edit.
+    """
+    session, client, path = _seed([
+        _code_cell("a", "x = 1"),
+        _code_cell("b", "y = 1"),
+    ])
+
+    real_read = client.read_notebook
+    call_count = {"n": 0}
+
+    async def _intercept(p: str) -> dict:
+        call_count["n"] += 1
+        result = await real_read(p)
+        if call_count["n"] == 1:
+            # User edits cell b between Claude's ref-resolve read and the
+            # helper's fresh re-read+precondition check.
+            client.notebook["cells"][1]["source"] = "y = 9999  # user"
+        return result
+
+    client.read_notebook = _intercept  # type: ignore[assignment]
+
+    with pytest.raises(NotebookConflictError):
+        await server.edit_cell(path, ref="b", source="y = 42  # claude")
+
+    # User's edit must remain — Claude must NOT have written.
+    assert client.notebook["cells"][1]["source"] == "y = 9999  # user"
+
+
+@pytest.mark.asyncio
 async def test_edit_cell_raises_when_target_deleted_concurrently() -> None:
     """Claude resolves edit_cell(b), but the user deletes cell b from VS Code
     before the mutator runs. Must raise NotebookConflictError, not silently

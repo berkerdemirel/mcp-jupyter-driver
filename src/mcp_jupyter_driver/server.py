@@ -488,7 +488,11 @@ async def edit_cell(path: str, ref: int | str, source: str) -> CellRef:
     async with session.exec_lock:
         nb = await session.read_notebook()
         idx = resolve_cell_index(nb, ref)
-        cell_id = nb["cells"][idx].get("id")
+        resolved = nb["cells"][idx]
+        cell_id = resolved.get("id")
+        seen_source = resolved.get("source", "")
+        if isinstance(seen_source, list):
+            seen_source = "".join(s for s in seen_source if isinstance(s, str))
 
         def _do(fresh_nb: dict) -> None:
             cells = fresh_nb.get("cells") or []
@@ -511,6 +515,7 @@ async def edit_cell(path: str, ref: int | str, source: str) -> CellRef:
         await session.mutate_notebook_fresh(
             _do,
             expected_cell_id=cell_id,
+            expected_source=seen_source if cell_id is not None else None,
             operation_name="edit_cell",
         )
     return CellRef(index=idx, cell_id=cell_id)
