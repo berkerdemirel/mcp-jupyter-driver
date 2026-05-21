@@ -603,6 +603,10 @@ class NotebookSession:
             out = mutated if mutated is not None else nb
             try:
                 await self.write_notebook(out, if_unmodified_since=last_modified)
+                # Awareness: roll the snapshot forward so this MCP-side
+                # mutation isn't surfaced as "user activity" on the next
+                # ``recent_user_activity`` call.
+                self.last_seen_notebook = out
                 return out
             except ConcurrentWriteError as e:
                 # Someone else wrote between our read and our PUT. Re-read

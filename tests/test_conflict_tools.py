@@ -361,6 +361,30 @@ async def test_recent_user_activity_reports_cell_changes_since_first_call() -> N
 
 
 @pytest.mark.asyncio
+async def test_recent_user_activity_does_not_report_claude_structural_edits() -> None:
+    """After Claude itself mutates the notebook through an MCP tool,
+    ``recent_user_activity`` must not surface that mutation as if the user
+    had done it. The snapshot is rolled forward inside
+    ``mutate_notebook_fresh``.
+    """
+    session, client, path = _seed([_code_cell("a", "x = 1")])
+    session.iopub_tap = None
+
+    # Seed the snapshot.
+    first = await server.recent_user_activity(path)
+    assert first.cell_changes == []
+
+    # Claude does a structural edit through the MCP tool surface.
+    await server.edit_cell(path, ref="a", source="x = 2  # claude")
+
+    # No user activity has occurred — should report no changes.
+    second = await server.recent_user_activity(path)
+    assert second.cell_changes == [], (
+        f"Claude's own edit_cell leaked into user activity: {second.cell_changes}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_run_code_keeps_temp_cell_when_run_raises(monkeypatch) -> None:
     """If the execution path raises (kernel died, websocket error, ...),
     the finally block should still attempt cleanup but skip the delete —
