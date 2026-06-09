@@ -102,23 +102,52 @@ uv sync
 uv run python -m mcp_jupyter_driver --self-check
 ```
 
-Register with Claude Code — add to `~/.claude.json` under the right
-`mcpServers` object (project-scoped or user-scoped):
+Register with Claude Code. The easiest way is the `claude mcp add` CLI —
+it writes to the right config file for you, so you never hand-edit JSON:
+
+```bash
+claude mcp add jupyter -s user -- \
+  uv --directory /absolute/path/to/mcp-jupyter-driver run python -m mcp_jupyter_driver
+```
+
+Everything after `--` is the command Claude runs to launch the server.
+Replace `/absolute/path/to/mcp-jupyter-driver` with this repo's absolute
+path (run `pwd` inside it). `-s` picks the **scope**:
+
+| `-s` value | Available in | Use when |
+|---|---|---|
+| `user` | every project on your machine | you want Jupyter everywhere (recommended) |
+| `local` *(default)* | only the current directory, only you | testing, or per-project |
+| `project` | anyone who clones the repo (writes `.mcp.json`) | sharing with a team |
+
+Restart Claude Code. `/mcp` should list `jupyter` with all tools.
+
+<details>
+<summary>Fallback: edit <code>~/.claude.json</code> by hand</summary>
+
+If you can't use the CLI, add the block manually. For **user scope** put
+it at the top level of `~/.claude.json`:
 
 ```json
 {
-  "jupyter": {
-    "type": "stdio",
-    "command": "uv",
-    "args": [
-      "--directory", "/absolute/path/to/mcp-jupyter-driver",
-      "run", "python", "-m", "mcp_jupyter_driver"
-    ]
+  "mcpServers": {
+    "jupyter": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "--directory", "/absolute/path/to/mcp-jupyter-driver",
+        "run", "python", "-m", "mcp_jupyter_driver"
+      ]
+    }
   }
 }
 ```
 
-Restart Claude Code. `/mcp` should list `jupyter` with all tools.
+For **local (per-project) scope**, nest the same `jupyter` object under
+`projects["/abs/path/to/your/project"].mcpServers` instead. `~/.claude.json`
+is large and machine-managed — a stray comma breaks it, which is why the
+CLI above is preferred. Restart Claude Code when done.
+</details>
 
 ## Use your real Python environment for the kernel
 
