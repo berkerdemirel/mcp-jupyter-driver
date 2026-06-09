@@ -96,7 +96,8 @@ Architecturally:
 Requires Python ≥ 3.10 and [uv](https://docs.astral.sh/uv/).
 
 ```bash
-git clone <this-repo> mcp-jupyter-driver
+git clone https://github.com/berkerdemirel/mcp-jupyter-driver.git
+
 cd mcp-jupyter-driver
 uv sync
 uv run python -m mcp_jupyter_driver --self-check
